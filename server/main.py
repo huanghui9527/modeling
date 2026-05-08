@@ -1,36 +1,42 @@
 """ZRT-Sim FastAPI service.
-
+ 
 Wraps the three CLI modes (graph capture, spec estimate, grid search) as
 async background jobs with a simple in-memory job store.
-
+ 
 Launch (from project root):
     uvicorn server.main:app --host 0.0.0.0 --port 8000
-
+ 
     # with auto-reload during development:
     uvicorn server.main:app --reload --host 0.0.0.0 --port 8000
-
+ 
 Poll a job:
     GET /jobs/{job_id}
 
+Download job output:
+    GET /jobs/{job_id}/download
+ 
 Interactive docs:
     http://localhost:8000/docs
 """
 from __future__ import annotations
-
+ 
 import io
 import json
+import shutil
 import sys
 import tempfile
 import threading
 import uuid
+import zipfile
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, List, Optional
-
+ 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
-
+from fastapi.responses import FileResponse, JSONResponse
+ 
 from .schemas import EstimateRequest, JobResponse, JobStatus, SearchRequest, TraceRequest
 
 # Ensure 'python/' is on sys.path so that zrt.* imports inside the training
@@ -46,9 +52,10 @@ app = FastAPI(
 )
 
 # ── In-memory job store ───────────────────────────────────────────────────────
-# Each entry: {id, status, result, error, created_at, finished_at}
+# Each entry: {id, status, result, error, created_at, finished_at, download_key}
 _jobs: dict[str, dict[str, Any]] = {}
 _lock = threading.Lock()
+_download_dir = Path(tempfile.gettempdir()) / "zrt_sim_downloads"
 
 
 def _new_job() -> str:
@@ -114,6 +121,90 @@ def get_job(job_id: str):
     if job is None:
         raise HTTPException(404, detail=f"Job '{job_id}' not found")
     return job
+
+
+@app.get(
+    "/jobs/{job_id}/download",
+    tags=["jobs"],
+    summary="Download job output as a zip package",
+    description=(
+        "Returns a download URL that the caller can use to fetch a zip file "
+        "containing all output artefacts produced by the job. "
+        "Only available after the job has completed successfully."
+    ),
+)
+def get_download_link(job_id: str):
+    with _lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, detail=f"Job '{job_id}' not found")
+    if job["status"] != JobStatus.DONE:
+        raise HTTPException(400, detail="Job has not completed yet")
+    if job.get("result") is None:
+        raise HTTPException(400, detail="Job has no output")
+    if "download_key" not in job:
+        _prepare_download(job)
+    return JSONResponse({
+        "download_url": f"/jobs/{job_id}/download-file",
+        "job_id": job_id,
+    })
+
+
+@app.get(
+    "/jobs/{job_id}/download-file",
+    tags=["jobs"],
+    summary="Stream the job's output zip file",
+)
+def download_job_file(job_id: str):
+    with _lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, detail=f"Job '{job_id}' not found")
+    if job["status"] != JobStatus.DONE:
+        raise HTTPException(400, detail="Job has not completed yet")
+    download_key = job.get("download_key")
+    if not download_key:
+        _prepare_download(job)
+        download_key = job["download_key"]
+    zip_path = _download_dir / download_key
+    if not zip_path.exists():
+        raise HTTPException(404, detail="Download package not found – it may have expired")
+    safe_name = job_id.replace("-", "_")
+    return FileResponse(
+        path=str(zip_path),
+        media_type="application/zip",
+        filename=f"zrt_output_{safe_name}.zip",
+    )
+
+
+def _prepare_download(job: dict) -> None:
+    """Build a zip file from the job result and store its download key."""
+    download_key = f"{job['id']}.zip"
+    zip_path = _download_dir / download_key
+    _download_dir.mkdir(parents=True, exist_ok=True)
+
+    result = job.get("result", {})
+
+    if result.get("output_dir") and Path(result["output_dir"]).exists():
+        # Trace job: zip the real output directory
+        _zip_directory(Path(result["output_dir"]), zip_path)
+    else:
+        # Estimate / search job: zip the result JSON
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("result.json", json.dumps(result, indent=2, ensure_ascii=False))
+            if result.get("summary"):
+                zf.writestr("summary.txt", str(result["summary"]))
+
+    with _lock:
+        job["download_key"] = download_key
+
+
+def _zip_directory(source: Path, dest: Path) -> None:
+    """Recursively zip a directory into dest."""
+    with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in source.rglob("*"):
+            if f.is_file():
+                zf.write(f, f.relative_to(source))
 
 
 # ── POST /trace ───────────────────────────────────────────────────────────────
