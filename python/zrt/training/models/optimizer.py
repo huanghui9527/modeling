@@ -207,7 +207,10 @@ def muon_flops_from_geometry(
         TP-Gathered row dim = ``hidden``, col dim = sharded).
       * PP shards layers across the ``pp`` stages.
     """
-    tp = max(1, tp); ep = max(1, ep); pp = max(1, pp); dp = max(1, dp)
+    tp = max(1, tp)
+    ep = max(1, ep)
+    pp = max(1, pp)
+    dp = max(1, dp)
     moe_ffn_col = max(1, moe_ffn // tp) if moe_ffn else 0
     ffn_col = max(1, ffn // tp) if ffn else 0
     attn_col = max(1, hidden // tp)
