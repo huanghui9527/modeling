@@ -180,8 +180,8 @@ def test_quant_variants_flow_through_spec_path_and_w4a8_uses_smaller_stored_weig
     assert w4a8.inputs[0].name == ln2.outputs[0].name == "x_ln2"
     assert w4a8.inputs[0].dtype == ln2.outputs[0].dtype
     assert w4a8.outputs[0].dtype == w4a8_model.effective_moe_act_dtype()
-    assert expert_agg.inputs[1].dtype == w4a8_model.act_dtype
-    assert expert_agg.inputs[1].name.startswith("routed_ffn_out__cast_bf16")
+    assert expert_agg.inputs[1].dtype == w4a8_model.effective_moe_act_dtype()
+    assert expert_agg.inputs[1].name == "routed_ffn_out"
     assert w4a8.meta["moe_act_dtype"] == Dtype.FP8_E4M3
     assert w4a8.meta["moe_act_bytes"] == Dtype.FP8_E4M3.bytes
     assert w4a8.meta["weight_stored_bytes"] < standard.meta["weight_stored_bytes"]

@@ -66,6 +66,7 @@ def test_train_hw_cli_delegates_to_graph_native_modeller(monkeypatch, capsys):
         pp_mode="formula",
         mega_moe=True,
         mega_moe_waves=4,
+        tp_coc=True,
     )
     fwd_graph = object()
     bwd_graph = object()

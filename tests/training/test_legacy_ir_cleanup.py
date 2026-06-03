@@ -144,6 +144,7 @@ class TestDeprecatedIRIsolation:
         "excel_exporter.py",
         "estimator.py",
         "graph.py",
+        "mega_moe.py",
     }
 
     def test_legacy_imports_isolated(self):

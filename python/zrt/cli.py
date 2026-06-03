@@ -707,6 +707,7 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         mega_moe_waves=getattr(args, "mega_moe_waves", 0),
         pp_schedule=args.pp_schedule,
         vpp_chunks=args.vpp_chunks,
+        pp_mode=getattr(args, "pp_mode", "trace"),
         tp_coc=args.tp_coc,
         return_transformed=True,
         quant=args.quant,

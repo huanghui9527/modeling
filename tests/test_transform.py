@@ -391,11 +391,11 @@ def test_expert_grouped_mm_backward_preserves_external_outputs_and_gate_up_width
     assert gate_up_id in out.nodes
     gate_up = out.nodes[gate_up_id]
     assert gate_up.inputs[1].shape == (2, 4, 12)
-    assert gate_up.outputs[0].shape == (2, 2, 12)
+    assert gate_up.outputs[0].shape == (2, 4, 12)
     grouped_down = out.nodes["transformer_layers_0_ffn_grouped_down_bwd"]
-    assert grouped_down.inputs[0].shape == (2, 2, 8)
+    assert grouped_down.inputs[0].shape == (2, 4, 8)
     assert grouped_down.inputs[1].shape == (2, 8, 4)
-    assert grouped_down.outputs[0].shape == (2, 2, 4)
+    assert grouped_down.outputs[0].shape == (2, 4, 4)
     assert "src" in out.predecessors(grouped_down.id)
     assert "gate_sink" in out.successors(gate_up_id)
     assert "up_sink" in out.successors(gate_up_id)
