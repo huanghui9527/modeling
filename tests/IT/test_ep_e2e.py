@@ -170,7 +170,7 @@ class TestEPE2E:
         _, _, t = ep8_all
         u = t["unified"]
         s, h = u.metadata.get("seq_len", _SEQ_LEN), u.metadata.get("hidden", _HIDDEN)
-        expected = _BATCH * s * h * _MOE_ACTIVE * 2 // _EP
+        expected = _BATCH * s * h * _MOE_ACTIVE * 2
         for n in u.nodes.values():
             if n.op_type == "comm.all_to_all":
                 assert n.attrs["msg_bytes"] == expected
@@ -484,8 +484,7 @@ class TestEPE2E:
         ep_rows = [r for r in rows if r["Collective Op"] == "all_to_all"]
         roles = [r["Role"] for r in ep_rows]
         assert roles.count("dispatch") == roles.count("combine") > 0
-        routed_tokens_per_ep_rank = (_BATCH * _SEQ_LEN * _MOE_ACTIVE + _EP - 1) // _EP
-        expected = routed_tokens_per_ep_rank * _HIDDEN * 2
+        expected = _BATCH * _SEQ_LEN * _MOE_ACTIVE * _HIDDEN * 2
         for row in ep_rows:
             assert row["Group Size"] == _EP
             assert int(row["Data Volume (bytes)"]) == expected

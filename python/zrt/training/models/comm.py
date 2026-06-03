@@ -22,20 +22,55 @@ The model has three layers, in order of generality:
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from zrt.hardware.spec import LinkSpec, TopologyTier
-from zrt.training.ir.training_graph import Collective, Graph
+from zrt.training.ir.training_graph import Collective
 from zrt.training.spec.model import ModelSpec
 from zrt.training.spec.strategy import Strategy
 from zrt.training.spec.system import SystemSpec
 
 if TYPE_CHECKING:
+    from zrt.ir.node import OpNode
+    from zrt.ir.graph import OpGraph
     from zrt.training.topology.comm_domain import CommDomain
     from zrt.training.topology.process_groups import ParallelGroups
 
 
-def collective_time(c: Collective, group_size: int, link: LinkSpec) -> float:
+@dataclass
+class CommSpec:
+    kind: str
+    group: str
+    bytes_: int
+    rounds: int = 1
+    name: str = ""
+    phase: str = "fwd"
+
+
+_COMM_OP_TO_KIND = {
+    "comm.all_gather": "AG",
+    "comm.reduce_scatter": "RS",
+    "comm.all_reduce": "AR",
+    "comm.all_to_all": "A2A",
+    "comm.send_recv": "P2P",
+    "comm.broadcast": "AG",
+}
+
+
+def comm_spec_from_node(node: "OpNode") -> CommSpec:
+    a = node.attrs
+    return CommSpec(
+        kind=_COMM_OP_TO_KIND.get(node.op_type, a.get("comm_kind", "AG")),
+        group=a.get("comm_group", "TP"),
+        bytes_=int(a.get("comm_bytes", 0)),
+        rounds=int(a.get("comm_rounds", 1)),
+        name=node.name or node.id,
+        phase=a.get("comm_phase", "fwd"),
+    )
+
+
+def collective_time(c: CommSpec, group_size: int, link: LinkSpec) -> float:
     """Return time in seconds for one collective operation.
 
     Alpha-beta model with NCCL bus-bandwidth convention:
@@ -102,7 +137,7 @@ def collective_time(c: Collective, group_size: int, link: LinkSpec) -> float:
 
 
 def collective_time_hierarchical(
-    c: Collective, group_size: int, system: SystemSpec,
+    c: CommSpec, group_size: int, system: SystemSpec,
 ) -> float:
     """AG/RS/AR/A2A over a (possibly multi-node) group using 2-level hierarchy.
 
@@ -141,10 +176,10 @@ def collective_time_hierarchical(
     if c.kind in ("AG", "RS"):
         # Stage 1: intra AG/RS of D ranks, output bytes per rank = S/L.
         # Stage 2: inter AG/RS of L nodes, output bytes per rank = S.
-        intra_c = Collective(name=c.name + "_intra", kind=c.kind,
-                             group=c.group, bytes_=S // L)
-        inter_c = Collective(name=c.name + "_inter", kind=c.kind,
-                             group=c.group, bytes_=S)
+        intra_c = CommSpec(kind=c.kind, group=c.group, bytes_=S // L,
+                           name=c.name + "_intra")
+        inter_c = CommSpec(kind=c.kind, group=c.group, bytes_=S,
+                           name=c.name + "_inter")
         return collective_time(intra_c, D, intra) + collective_time(inter_c, L, inter)
 
     if c.kind == "A2A":
@@ -157,17 +192,17 @@ def collective_time_hierarchical(
         # never worse than the pre-hier path — hier wins for
         # latency-bound messages, flat wins for bandwidth-bound ones
         # where the added intra phase costs more than it saves on inter.
-        intra_c = Collective(name=c.name + "_intra_a2a", kind="A2A",
-                             group=c.group, bytes_=S)
-        inter_c = Collective(name=c.name + "_inter_a2a", kind="A2A",
-                             group=c.group, bytes_=S)
+        intra_c = CommSpec(kind="A2A", group=c.group, bytes_=S,
+                           name=c.name + "_intra_a2a")
+        inter_c = CommSpec(kind="A2A", group=c.group, bytes_=S,
+                           name=c.name + "_inter_a2a")
         t_hier = collective_time(intra_c, D, intra) + collective_time(inter_c, L, inter)
         t_flat = collective_time(c, N, inter)
         return min(t_flat, t_hier)
 
     # AR decomposes into RS + AG, each hierarchical.
-    rs_c = Collective(name=c.name + "_rs", kind="RS", group=c.group, bytes_=S)
-    ag_c = Collective(name=c.name + "_ag", kind="AG", group=c.group, bytes_=S)
+    rs_c = CommSpec(kind="RS", group=c.group, bytes_=S, name=c.name + "_rs")
+    ag_c = CommSpec(kind="AG", group=c.group, bytes_=S, name=c.name + "_ag")
     return (
         collective_time_hierarchical(rs_c, N, system)
         + collective_time_hierarchical(ag_c, N, system)
@@ -233,7 +268,7 @@ def _tier_breakdown(
 
 
 def collective_time_multi_tier(
-    c: Collective,
+    c: CommSpec,
     ranks: list[int],
     system: SystemSpec,
 ) -> float:
@@ -283,8 +318,8 @@ def collective_time_multi_tier(
         return collective_time(c, N, outermost_link)
 
     if c.kind == "AR":
-        rs_c = Collective(name=c.name + "_rs", kind="RS", group=c.group, bytes_=S)
-        ag_c = Collective(name=c.name + "_ag", kind="AG", group=c.group, bytes_=S)
+        rs_c = CommSpec(kind="RS", group=c.group, bytes_=S, name=c.name + "_rs")
+        ag_c = CommSpec(kind="AG", group=c.group, bytes_=S, name=c.name + "_ag")
         return (
             collective_time_multi_tier(rs_c, ranks, system)
             + collective_time_multi_tier(ag_c, ranks, system)
@@ -300,9 +335,9 @@ def collective_time_multi_tier(
         # pre-hier flat-outermost path.
         total = 0.0
         for d_i, link_i in breakdown:
-            sub_c = Collective(
-                name=f"{c.name}_a2a_t{d_i}", kind="A2A", group=c.group,
-                bytes_=S,
+            sub_c = CommSpec(
+                kind="A2A", group=c.group, bytes_=S,
+                name=f"{c.name}_a2a_t{d_i}",
             )
             total += collective_time(sub_c, d_i, link_i)
         outermost_link = breakdown[-1][1]
@@ -315,9 +350,9 @@ def collective_time_multi_tier(
     for d_i, link_i in breakdown:
         prod_inner *= d_i
         out_bytes = S * prod_inner // N if N > 0 else 0
-        sub_c = Collective(
-            name=f"{c.name}_t{prod_inner}", kind=c.kind, group=c.group,
-            bytes_=out_bytes,
+        sub_c = CommSpec(
+            kind=c.kind, group=c.group, bytes_=out_bytes,
+            name=f"{c.name}_t{prod_inner}",
         )
         total += collective_time(sub_c, d_i, link_i)
     return total
@@ -343,7 +378,7 @@ def tier_for_group(
 
 
 def total_comm_time(
-    graph: Graph, model: ModelSpec, system: SystemSpec, strategy: Strategy,
+    graph: "OpGraph", model: ModelSpec, system: SystemSpec, strategy: Strategy,
     *,
     domain: "CommDomain | None" = None,
 ) -> dict[str, float]:
@@ -362,8 +397,20 @@ def total_comm_time(
     result: dict[str, float] = {}
     groups = domain.groups
 
-    for c in graph.collectives:
-        result[c.name] = domain.time(c)
+    if hasattr(graph, "collectives"):
+        for coll in graph.collectives:
+            c = CommSpec(
+                kind=coll.kind, group=coll.group, bytes_=coll.bytes_,
+                rounds=coll.rounds, name=coll.name,
+                phase=getattr(coll, "phase", "fwd"),
+            )
+            result[c.name] = domain.time(c)
+    else:
+        for node in graph.nodes.values():
+            if not node.is_comm:
+                continue
+            c = comm_spec_from_node(node)
+            result[c.name] = domain.time(c)
 
     # DP gradient reduction (at step end)
     if strategy.dp > 1:
@@ -378,9 +425,9 @@ def total_comm_time(
         else:
             P_dp = P
         grad_bytes = int(P_dp * model.grad_dtype.bytes)
-        dp_c = Collective(
-            name="dp_grad_reduce", kind="AR" if strategy.zero_stage == 0 else "RS",
-            group="DP", bytes_=grad_bytes, inserted_after="optimizer_step",
+        dp_c = CommSpec(
+            kind="AR" if strategy.zero_stage == 0 else "RS",
+            group="DP", bytes_=grad_bytes, name="dp_grad_reduce",
         )
         result[dp_c.name] = domain.time(dp_c)
 
@@ -424,13 +471,11 @@ def muon_comm_times_from_params(
         if group_size <= 1 or bytes_ <= 0:
             return 0.0, 0.0
         ag = collective_time_hierarchical(
-            Collective(name="muon_ag", kind="AG", group="DP",
-                       bytes_=bytes_, inserted_after="backward_end"),
+            CommSpec(kind="AG", group="DP", bytes_=bytes_, name="muon_ag"),
             group_size, system,
         )
         rs = collective_time_hierarchical(
-            Collective(name="muon_rs", kind="RS", group="DP",
-                       bytes_=bytes_, inserted_after="optimizer_step"),
+            CommSpec(kind="RS", group="DP", bytes_=bytes_, name="muon_rs"),
             group_size, system,
         ) if rotation else 0.0
         return ag, rs
@@ -504,13 +549,11 @@ def optimizer_comm_time(
         group_size = domain.group_size(group_kind)
         if group_size <= 1 or bytes_ <= 0:
             return 0.0, 0.0
-        ag_c = Collective(
-            name="muon_ag", kind="AG", group=group_kind,
-            bytes_=bytes_, inserted_after="backward_end",
+        ag_c = CommSpec(
+            kind="AG", group=group_kind, bytes_=bytes_, name="muon_ag",
         )
-        rs_c = Collective(
-            name="muon_rs", kind="RS", group=group_kind,
-            bytes_=bytes_, inserted_after="optimizer_step",
+        rs_c = CommSpec(
+            kind="RS", group=group_kind, bytes_=bytes_, name="muon_rs",
         )
         ag = domain.time(ag_c)
         rs = domain.time(rs_c) if rotation else 0.0

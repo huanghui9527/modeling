@@ -152,6 +152,19 @@ def main() -> None:
              "full = all forward ops recomputed; "
              "selective = attention ops only.",
     )
+    parser.add_argument(
+        "--mega-moe",
+        action="store_true",
+        default=False,
+        help="Fuse captured forward routed MoE expert compute into one MegaMoE op "
+             "with internal dispatch/compute/combine modelling.",
+    )
+    parser.add_argument(
+        "--mega-moe-waves",
+        type=int,
+        default=0,
+        help="Requested MegaMoE wave count for internal EP overlap (0 = hardware/default).",
+    )
 
     # ── Output ────────────────────────────────────────────────────────────────
     parser.add_argument("--output-dir", "-o",
@@ -614,7 +627,15 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
 
 
 def _run_training_modelling(args, model_id: str, hw, result) -> None:
-    """Run graph-native training modelling on captured training graphs."""
+    """Run graph-native training modelling on captured training graphs.
+
+    .. deprecated::
+        此函数将在 GraphCoarsenPass 实现后被 ``_run_capture_estimate`` 替代。
+        当前保留用于 --model-id --train --hw 的旧路径（路径 A 旧入口）。
+        新入口 ``_run_capture_estimate`` 使用 ``estimate_via_pipeline(capture=...)``
+        走统一 Transform Pipeline，但需要 GraphCoarsenPass 将 aten-level ops
+        聚合为 block-level ops 后才能完全替代。
+    """
     from python.zrt.transform.analysis import estimate_training_from_graphs
     from python.zrt.transform.exporter import export_training_graphs
 
@@ -682,6 +703,8 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
             args.recompute_policy
             or ("full" if args.gradient_checkpointing else "none")
         ),
+        mega_moe=getattr(args, "mega_moe", False),
+        mega_moe_waves=getattr(args, "mega_moe_waves", 0),
         pp_schedule=args.pp_schedule,
         vpp_chunks=args.vpp_chunks,
         tp_coc=args.tp_coc,
@@ -757,29 +780,137 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         logger.warning("Training report export failed: %s", exc)
 
 
+def _run_capture_estimate(args, model_id: str, hw) -> None:
+    """CLI --model-id --train --hw 的统一入口（路径 A）。
+
+    构造 CaptureConfig + ModelSpec + SystemSpec + Strategy，
+    调用 estimate_via_pipeline(capture=cfg)。
+    """
+    from python.zrt.training.spec.capture_config import CaptureConfig
+    from python.zrt.training.search.estimator import estimate_via_pipeline
+    from python.zrt.training.spec.model import ModelSpec, LayerKind
+    from python.zrt.training.spec.system import GPU, SystemSpec
+    from python.zrt.training.spec.strategy import Strategy
+    from python.zrt.training.spec.dtype import Dtype
+
+    capture = CaptureConfig(
+        model_id=model_id,
+        num_layers=args.layers,
+        seq_len=args.seq_len,
+        batch_size=args.batch_size,
+        gradient_checkpointing=args.gradient_checkpointing,
+        graph_mode=getattr(args, "graph_mode", False),
+    )
+
+    model = _model_spec_from_hf(model_id, args)
+    gpu = GPU(
+        name=hw.name,
+        flops_bf16=hw.compute.bf16_tflops,
+        flops_fp8=hw.compute.fp8_tops or hw.compute.bf16_tflops * 2,
+        flops_fp4=hw.compute.fp4_tops,
+        hbm_gb=hw.memory.capacity_gb,
+        hbm_bw_gbps=hw.memory.hbm_bandwidth_gbps,
+        cube_tflops=hw.compute.cube_bf16_tflops,
+        vector_tflops=hw.compute.vector_bf16_tflops,
+        overlap_ratio=dict(hw.compute.overlap_ratio),
+        sram_kb_per_sm=hw.compute.sram_kb_per_sm,
+        ep_overlap_waves=hw.compute.ep_overlap_waves,
+        compute_efficiency=hw.compute.compute_efficiency,
+        mem_bw_efficiency=hw.memory.mem_bw_efficiency,
+    )
+    system = SystemSpec(
+        gpu=gpu,
+        host_mem_gb=256.0,
+        interconnect=hw.interconnect,
+        nodes=1,
+        gpus_per_node=8,
+    )
+
+    strategy = Strategy(
+        tp=args.tp, cp=args.cp, pp=args.pp, ep=args.ep, dp=args.dp,
+        micro_batch=args.micro_batch, global_batch=args.global_batch,
+        zero_stage=args.zero_stage,
+    )
+
+    report = estimate_via_pipeline(model, system, strategy, capture=capture)
+
+    try:
+        print(f"\n{report.summary()}")
+    except UnicodeEncodeError:
+        logger.info("Training summary:\n%s", report.summary())
+
+    logger.info("Capture estimate complete for %s", model_id)
+
+
+def _model_spec_from_hf(model_id: str, args) -> "ModelSpec":
+    """Construct ModelSpec from HF model config.json + CLI args.
+
+    Reads the model's config.json to extract architecture parameters,
+    falls back to CLI args for missing fields.
+    """
+    import json
+    from python.zrt.training.spec.model import ModelSpec, LayerKind
+    from python.zrt.training.spec.dtype import Dtype
+
+    cfg_path = Path(model_id) / "config.json"
+    if not cfg_path.is_absolute():
+        cfg_path = Path.cwd() / cfg_path
+
+    cfg = {}
+    if cfg_path.exists():
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+
+    hidden = cfg.get("hidden_size", args.hidden)
+    num_heads = cfg.get("num_attention_heads", 32)
+    num_kv_heads = cfg.get("num_key_value_heads", num_heads)
+    head_dim = cfg.get("head_dim", hidden // num_heads)
+    ffn = cfg.get("intermediate_size", hidden * 4)
+    vocab = cfg.get("vocab_size", 32000)
+    seq_len = args.seq_len
+
+    num_layers = args.layers
+    num_experts = cfg.get("num_local_experts", 0) or cfg.get("n_routed_experts", 0)
+    top_k = cfg.get("num_experts_per_tok", 0) or cfg.get("moe_topk", 0) or cfg.get("top_k", 0)
+    moe_ffn = cfg.get("moe_intermediate_size", 0) or cfg.get("route_expert_hidden", 0)
+
+    if num_experts > 0:
+        layers = [LayerKind.DENSE] * min(3, num_layers) + [LayerKind.MOE] * max(0, num_layers - 3)
+    else:
+        layers = [LayerKind.DENSE] * num_layers
+
+    return ModelSpec(
+        hidden=hidden, ffn=ffn, num_heads=num_heads, num_kv_heads=num_kv_heads,
+        head_dim=head_dim, vocab=vocab, seq_len=seq_len, layers=layers,
+        num_experts=num_experts, top_k=top_k, moe_ffn=moe_ffn,
+        act_dtype=Dtype.BF16,
+    )
+
+
 def _run_estimate(config_path: str, output_path: str | None, *, breakdown: bool = False) -> None:
     """Run spec-based training estimation from a YAML config."""
     from python.zrt.training.io.config_loader import load_specs, load_anchor_config
     from python.zrt.training.search.estimator import estimate
     from python.zrt.training.search.report import report_summary, report_to_json
-    from python.zrt.training.ir.builders import build_graph
-    from python.zrt.training.models.flops import op_cost as _op_cost, total_training_flops
+    from python.zrt.training.ir.opgraph_builder import build_opgraph
+    from python.zrt.training.models.flops import op_cost_from_node, total_training_flops
     from python.zrt.training.io.excel_exporter import export_estimate_excel
     from python.zrt.training.io.html_exporter import export_estimate_html
 
     try:
-        model, system, strategy = load_specs(config_path)
+        model, system, strategy, capture = load_specs(config_path)
     except (KeyError, TypeError):
-        model, system, strategy = load_anchor_config(config_path)
+        model, system, strategy, capture = load_anchor_config(config_path)
 
-    # Build graph for op-level details, then reuse it in estimate()
-    # to avoid duplicate build_graph() calls.
-    graph = build_graph(model, strategy)
+    # Build OpGraph for op-level details, then reuse it in estimate()
+    # to avoid duplicate build_opgraph() calls.
+    graph = build_opgraph(model, strategy)
     op_costs: dict[str, object] = {}
-    for op in graph.ops:
-        op_costs[op.name] = _op_cost(op, model, system)
+    for node in graph.nodes.values():
+        if not node.is_comm:
+            op_costs[node.id] = op_cost_from_node(node, model, system)
 
-    report = estimate(model, system, strategy, graph=graph)
+    report = estimate(model, system, strategy, graph=graph, capture=capture)
 
     if output_path:
         # If output_path is a directory or ends with a filename without extension,
@@ -847,7 +978,7 @@ def _run_search(config_path: str, output_path: str | None) -> None:
     from python.zrt.training.search.space import SearchSpace
     from python.zrt.training.search.report import report_summary, report_to_dict
 
-    model, system, strategy = load_specs(config_path)
+    model, system, strategy, _capture = load_specs(config_path)
 
     # Preserve config-level batch settings in search space
     space = SearchSpace(

@@ -160,8 +160,14 @@ def test_html_export_includes_interactive_op_share(tmp_path):
     assert "function renderOpShare()" in html
     assert "renderOpShare();" in html
     assert "opFocus" in html
-    assert "opBreakdown" in html
+    assert "opModuleDim" in html
     assert "function donutSvg(" in html
+    # Two side-by-side pies: module view + operator (compute-unit) view.
+    assert "pie-pair" in html
+    assert "模块视角" in html
+    assert "算子视角 · 计算单元" in html
+    assert "pie-leg-n" in html             # per-bucket operator count
+    assert "bound-tag" in html             # bound tag next to module-view buckets
     # Calibration section renumbered to 6 (op-share inserted before it).
     assert "6. 报告校准" in html
     # Per-op enrichment fields the component depends on are embedded in DATA.

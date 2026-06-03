@@ -207,6 +207,11 @@ class Strategy:
     # overlap
     tp_overlap: TPOverlap = TPOverlap.NONE
     ep_overlap: bool = False
+    # Spec-path fused MoE operator. When enabled, MoE routed experts are built
+    # as one mega_moe op that includes dispatch, expert FFN, and combine.
+    mega_moe: bool = False
+    # 0 means resolve from hardware ep_overlap_waves or a conservative default.
+    mega_moe_waves: int = 0
     # PP P2P (activation send between adjacent stages) hide-in-bwd_dw, only
     # meaningful for dual-stream schedules (DualPipe / DualPipeV). Default
     # OFF: even with DualPipe(V), PP P2P stays on the critical path unless

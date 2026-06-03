@@ -16,9 +16,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from zrt.training.ir.training_graph import Op
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from zrt.ir.node import OpNode
+
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import ModelSpec
+
+
+def _kind(op) -> str:
+    if hasattr(op, "attrs"):
+        return op.attrs.get("spec_kind", op.op_type)
+    return op.kind
 
 
 @dataclass(frozen=True)
@@ -43,15 +53,15 @@ class OpDtypeBundle:
     grad_act:    Dtype
 
 
-def _cast_bundle(op: Op, model: ModelSpec) -> OpDtypeBundle:
-    """Cast op's dtypes live entirely in ``op.meta``.
+def _meta(op) -> dict:
+    return op.attrs if hasattr(op, "attrs") else op.meta
 
-    ``compute`` is set to ``dst_dtype`` so ``peak_tflops_for`` picks the
-    realistic unit; in practice cast op has 0 FLOPs so this only affects
-    diagnostics in ``mfu_native``.
-    """
-    src = op.meta.get("src_dtype", model.act_dtype)
-    dst = op.meta.get("dst_dtype", model.act_dtype)
+
+def _cast_bundle(op, model: ModelSpec) -> OpDtypeBundle:
+    """Cast op's dtypes live entirely in meta/attrs."""
+    m = _meta(op)
+    src = m.get("src_dtype", model.act_dtype)
+    dst = m.get("dst_dtype", model.act_dtype)
     return OpDtypeBundle(
         in_act=src,
         weight=src,                 # unused; cast has no weight
@@ -63,22 +73,22 @@ def _cast_bundle(op: Op, model: ModelSpec) -> OpDtypeBundle:
     )
 
 
-def resolve_op_dtypes(op: Op, model: ModelSpec) -> OpDtypeBundle:
+def resolve_op_dtypes(op: OpNode, model: ModelSpec) -> OpDtypeBundle:
     """Return the dtype bundle for one op.
 
     Spec-specific ops (``kind == 'cast'``) are handled locally; all other
     component buckets delegate to the shared ``dispatch()`` in
     ``quant_dispatch.py``.
     """
-    if op.kind == "cast":
+    if _kind(op) == "cast":
         return _cast_bundle(op, model)
 
     from zrt.training.models.quant_dispatch import dispatch
-    comp = getattr(op, "component", None) or "default"
+    comp = op.component or "default"
     return dispatch(comp, model)
 
 
-def expected_input_dtype(op: Op, ti: int, model: ModelSpec) -> Dtype:
+def expected_input_dtype(op: OpNode, ti: int, model: ModelSpec) -> Dtype:
     """Dtype that ``op.inputs[ti]`` must arrive in.
 
     Used by ``cast_pass`` to decide where to insert cast ops. Defaults to
@@ -86,30 +96,19 @@ def expected_input_dtype(op: Op, ti: int, model: ModelSpec) -> Dtype:
     dtypes differ.
     """
     bundle = resolve_op_dtypes(op, model)
+    k = _kind(op)
 
-    if op.kind == "add":
-        # Residual adds are untagged and use the residual stream dtype.
-        # Expert aggregation adds are tagged as routed/shared expert and stay
-        # inside the MoE region; casting them to residual dtype would insert
-        # spurious FP8->BF16 casts before the actual residual boundary.
+    if k == "add":
         if op.component in {"routed_expert", "shared_expert"}:
             return bundle.in_act
         return model.effective_residual_dtype()
 
-    if op.kind in ("dispatch", "combine"):
-        # Token routing happens in MoE-region activation dtype.
+    if k in ("dispatch", "combine"):
         return model.effective_moe_act_dtype()
 
-    if op.kind in ("mhc_pre", "mhc_post", "mhc_head"):
-        # Hyper-Connection internals: mhc_pre emits sinkhorn intermediates
-        # (hc_post, hc_comb) in FP32 deliberately; mhc_post consumes them
-        # in FP32. These tensors stay inside the HC sub-network and never
-        # cross a region boundary. Trust the tensor's producer-defined
-        # dtype rather than forcing it back to the bundle's act dtype.
+    if k in ("mhc_pre", "mhc_post", "mhc_head"):
         if 0 <= ti < len(op.inputs):
             return op.inputs[ti].dtype
         return bundle.in_act
 
-    # matmul / attn_core / softmax / ln / rmsnorm / rope / swiglu read
-    # activations in their region's act dtype.
     return bundle.in_act

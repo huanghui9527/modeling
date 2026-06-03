@@ -30,10 +30,19 @@ cast_pass runs AFTER builders construct the transformer ops and BEFORE
     insertion sites could disturb the (AG → matmul → RS) wrapping
     invariant the collective inserter depends on.
 
-The single entry point is :func:`insert_cast_pass`.
+Entry points:
+  - :func:`insert_cast_pass` — legacy Graph path
+  - :func:`insert_cast_pass_opgraph` — OpGraph-native path (Phase B2)
 """
 
 from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from zrt.ir.graph import OpGraph
+    from zrt.ir.node import OpNode
+    from zrt.ir.types import TensorMeta
 
 from zrt.training.ir.training_graph import Graph, Op, Tensor
 from zrt.training.models.quant import expected_input_dtype, resolve_op_dtypes
@@ -202,3 +211,198 @@ def _rebuild_layer_index(graph: Graph) -> None:
     if current_lid is not None:
         new_idx[current_lid] = (start, len(graph.ops))
     graph.layer_index = new_idx
+
+
+# ── OpGraph-native cast pass (Phase B2) ─────────────────────────────────────
+
+def insert_cast_pass_opgraph(
+    graph: "OpGraph", model: ModelSpec, quant: QuantPolicy | None = None,
+) -> None:
+    """Splice cast OpNodes at dtype boundaries IN-PLACE on an OpGraph.
+
+    This is the OpGraph-native version of :func:`insert_cast_pass`.
+    It iterates nodes in topological order, checks each input's dtype
+    against the consumer's expected dtype, and inserts cast OpNodes
+    between producer and consumer when they differ.
+
+    Parameters
+    ----------
+    graph : OpGraph
+        The computation graph to modify in-place.
+    model : ModelSpec
+        Model architecture specification for dtype resolution.
+    quant : QuantPolicy, optional
+        Quantization policy controlling cast fusion. Defaults to
+        ``QuantPolicy()`` (all casts fused → 0 cost).
+    """
+    from zrt.ir.graph import OpGraph
+    from zrt.ir.node import OpNode
+    from zrt.ir.types import TensorMeta
+    from zrt.ir.edge import Edge
+
+    if quant is None:
+        quant = QuantPolicy()
+
+    producer_dtype: dict[str, Dtype] = {}
+    producer_kind: dict[str, str] = {}
+    producer_node: dict[str, str] = {}
+    producer_slot: dict[str, int] = {}
+
+    def _pk(tensor_id: str, layer: str) -> str:
+        if layer and layer != "-1":
+            return f"{layer}:{tensor_id}"
+        return tensor_id
+
+    for node in graph.nodes.values():
+        for slot, t in enumerate(node.outputs):
+            key = _pk(t.id, node.layer)
+            producer_dtype[key] = t.dtype
+            producer_kind[key] = node.attrs.get("spec_kind", node.op_type)
+            producer_node[key] = node.id
+            producer_slot[key] = slot
+            producer_dtype[t.id] = t.dtype
+            producer_kind[t.id] = node.attrs.get("spec_kind", node.op_type)
+
+    cast_counter = 0
+    nodes_to_insert: list[tuple[str, str, int, OpNode, Edge, Edge]] = []
+
+    for node in list(graph.nodes.values()):
+        if node.attrs.get("spec_kind") == "cast":
+            continue
+
+        for dst_idx, t_in in enumerate(node.inputs):
+            need = expected_input_dtype(node, dst_idx, model)
+            layer_key = _pk(t_in.id, node.layer)
+            have = producer_dtype.get(layer_key, producer_dtype.get(t_in.id, t_in.dtype))
+            if have == need:
+                continue
+
+            cast_counter += 1
+            site = _classify_site_opgraph(node, producer_kind.get(layer_key, producer_kind.get(t_in.id, "")))
+            fused = quant.is_fused_at(site)
+            needs_amax = need in _QUANT_DTYPES and have not in _QUANT_DTYPES
+
+            src_node_id = producer_node.get(layer_key, producer_node.get(t_in.id, ""))
+            src_slot = producer_slot.get(layer_key, producer_slot.get(t_in.id, 0))
+
+            cast_node, new_edge_in, new_edge_out = _make_cast_opnode(
+                src_tensor=t_in, src_dtype=have, dst_dtype=need,
+                consumer=node, dst_idx=dst_idx, site=site, fused=fused,
+                needs_amax=needs_amax, cast_id=cast_counter,
+                producer_node_id=src_node_id,
+                producer_slot=src_slot,
+            )
+            nodes_to_insert.append((t_in.id, src_node_id, src_slot,
+                                    cast_node, new_edge_in, new_edge_out))
+            producer_dtype[cast_node.outputs[0].id] = need
+            producer_kind[cast_node.outputs[0].id] = "cast"
+            producer_node[cast_node.outputs[0].id] = cast_node.id
+            producer_slot[cast_node.outputs[0].id] = 0
+
+    replaced_edges: set[int] = set()
+    for src_tensor_id, src_node_id, src_slot, cast_node, edge_in, edge_out in nodes_to_insert:
+        graph.add_node(cast_node)
+        replaced = False
+        for i, e in enumerate(graph.edges):
+            if (id(e) not in replaced_edges
+                    and e.src == src_node_id and e.src_idx == src_slot
+                    and e.dst == edge_out.dst and e.dst_idx == edge_out.dst_idx):
+                graph.edges[i] = edge_in
+                replaced_edges.add(id(e))
+                replaced = True
+                break
+        if not replaced:
+            graph.add_edge(edge_in)
+        graph.add_edge(edge_out)
+    graph._rebuild_adjacency()
+
+
+def _classify_site_opgraph(consumer: "OpNode", producer_kind: str) -> str:
+    """Decide which QuantPolicy fuse_* flag applies to this boundary (OpGraph version)."""
+    consumer_kind = consumer.attrs.get("spec_kind", consumer.op_type)
+    if consumer_kind == "matmul" and producer_kind in {"ln", "rmsnorm"}:
+        return "ln_epilog"
+    if producer_kind == "matmul":
+        return "gemm_epilog"
+    if consumer.component == "attention" and consumer_kind in {
+        "attn_core", "sparse_attn", "hca_attn", "swa_attn",
+        "rope", "ln", "rmsnorm",
+    }:
+        return "attn_internal"
+    return "other"
+
+
+def _make_cast_opnode(
+    src_tensor: "TensorMeta", src_dtype: Dtype, dst_dtype: Dtype,
+    consumer: "OpNode", dst_idx: int, site: str, fused: bool,
+    needs_amax: bool, cast_id: int,
+    producer_node_id: str = "",
+    producer_slot: int = 0,
+) -> tuple["OpNode", "Edge", "Edge"]:
+    """Create a cast OpNode and its input/output edges.
+
+    Returns
+    -------
+    tuple[OpNode, Edge, Edge]
+        The cast node, the edge from producer to cast, and the edge from cast to consumer.
+    """
+    from zrt.ir.node import OpNode
+    from zrt.ir.types import TensorMeta
+    from zrt.ir.edge import Edge
+
+    out_name = f"{src_tensor.id}__cast_{dst_dtype.value}_{cast_id}"
+    shape = src_tensor.shape
+    shape_local = src_tensor.shape_local
+
+    out_t = TensorMeta.from_shape_dtype(out_name, shape, dst_dtype, shape_local)
+    in_t = TensorMeta.from_shape_dtype(src_tensor.id, shape, src_dtype, shape_local)
+
+    n = 1
+    for dim in (shape_local if shape_local else shape):
+        n *= int(dim) if dim else 1
+
+    cast_id_str = f"cast_{cast_id}_{src_dtype.value}_to_{dst_dtype.value}"
+    cast_node = OpNode(
+        id=f"{consumer.id}.{cast_id_str}",
+        op_type="spec.cast",
+        inputs=[in_t],
+        outputs=[out_t],
+        attrs={
+            "num_elements": int(n),
+            "src_dtype": src_dtype,
+            "dst_dtype": dst_dtype,
+            "fused": bool(fused),
+            "needs_amax": bool(needs_amax),
+            "site": site,
+            "adjacent_op_name": consumer.id,
+            "spec_kind": "cast",
+            "layer_kind": consumer.attrs.get("layer_kind", "dense"),
+            "source": "model_spec",
+        },
+        scope=consumer.scope,
+        category="compute",
+        layer=consumer.layer,
+        component="cast",
+        name=cast_id_str,
+    )
+
+    if producer_node_id:
+        edge_src = producer_node_id
+    else:
+        edge_src = src_tensor.id.rsplit("_", 1)[0] if "_" in src_tensor.id else src_tensor.id
+    edge_in = Edge(
+        src=edge_src,
+        src_idx=producer_slot,
+        dst=cast_node.id,
+        dst_idx=0,
+        tensor=in_t,
+    )
+    edge_out = Edge(
+        src=cast_node.id,
+        src_idx=0,
+        dst=consumer.id,
+        dst_idx=dst_idx,
+        tensor=out_t,
+    )
+
+    return cast_node, edge_in, edge_out

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from zrt.training.ir.training_graph import Op
+from zrt.ir.node import OpNode
 from zrt.training.models.quant import (
     OpDtypeBundle, expected_input_dtype, resolve_op_dtypes,
 )
@@ -28,8 +28,8 @@ def _model(**dtype_kwargs) -> ModelSpec:
     )
 
 
-def _op(name: str, kind: str = "matmul", component: str | None = None, **meta) -> Op:
-    return Op(name=name, kind=kind, component=component, meta=dict(meta))
+def _op(name: str, kind: str = "matmul", component: str | None = None, **meta) -> OpNode:
+    return OpNode(id=name, op_type=kind, component=component or "", attrs=dict(meta))
 
 
 # ── Component dispatch ────────────────────────────────────────────────────

@@ -1,0 +1,37 @@
+# DeepSeek-V4-Pro 3D parallel training - Ascend 910C + MegaMoE
+# Run:
+#   python -m python.zrt --estimate-config python/zrt/training/configs/deepseek_v4_pro_3d_ascend_910c_mega_moe.yaml
+
+model:
+  base: deepseek_v4_pro
+  quant_preset: deepseek_v4_fp8_fp4
+
+system:
+  hw: ascend_910c
+  nodes: 256
+  gpus_per_node: 8
+  host_mem_gb: 2048
+
+strategy:
+  tp: 8
+  cp: 1
+  pp: 4
+  ep: 64
+  dp: 64
+  micro_batch: 1
+  global_batch: 64
+  pp_schedule: dualpipev
+  zero_stage: 1
+  mega_moe: true
+  # 0 means auto-select the best legal wave count with the internal
+  # dispatch/compute/combine pipeline model.
+  mega_moe_waves: 0
+  recompute:
+    per_layer:
+      moe: ["attn_block"]
+  optimizer: muon
+  muon_config:
+    ns_steps: 10
+    rotation: true
+    adam_param_types: ["embed", "lm_head", "router", "bias"]
+    muon_param_fraction: 0.85

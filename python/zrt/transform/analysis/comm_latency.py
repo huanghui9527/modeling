@@ -117,6 +117,11 @@ class CommLatencyPass(GraphPass):
             if data_bytes == 0:
                 data_bytes = 1  # Conservative: at least 1 byte
 
+            # CoC tile factor: each tile comm node transfers 1/K of the data
+            coc_tile_k = int(node.attrs.get("coc_tile_k", 1))
+            if coc_tile_k > 1:
+                data_bytes = max(1, data_bytes // coc_tile_k)
+
             # Quant-aware payload scaling: applies the dtype ratio to raw captured
             # tensor sizes (msg_bytes or mem_bytes — always BF16-based). This is
             # independent of QuantizationPass._annotate_comm_payloads which scales

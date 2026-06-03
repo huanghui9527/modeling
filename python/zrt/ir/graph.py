@@ -257,8 +257,8 @@ class OpGraph:
     ) -> "OpGraph":
         """Build OpGraph from ModelSpec geometry without tracing.
 
-        This creates a lightweight DAG suitable for analytical estimation,
-        using the same OpGraph structure as traced graphs.
+        Delegates to ``build_opgraph()`` which produces a full OpGraph
+        with sharding, cast pass, and collectives already applied.
 
         Args:
             model: ModelSpec with layer geometry
@@ -266,56 +266,17 @@ class OpGraph:
             phase: Phase name (default: "training")
 
         Returns:
-            OpGraph with nodes corresponding to training.ir.Graph ops
+            OpGraph with nodes built by ``build_opgraph_direct()``.
         """
-        from zrt.training.ir.builders import build_graph
-        from zrt.training.ir.training_graph import Graph as TrainingGraph
+        from zrt.training.ir.opgraph_builder import build_opgraph
 
-        training_g: TrainingGraph = build_graph(model, strategy)
-
-        # Convert Training Ops → OpNodes
-        nodes = {}
-        for op in training_g.ops:
-            nodes[op.name] = OpNode(
-                id=op.name,
-                op_type=op.kind,
-                inputs=[],
-                outputs=[],
-                attrs={**op.meta},
-                annotations={
-                    "layer_id": op.layer_id,
-                    "layer_kind": str(op.layer_kind),
-                },
-            )
-
-        # Build sequential edges (op[i] → op[i+1] within layer)
-        edges = []
-        op_names = list(nodes.keys())
-        for i in range(len(op_names) - 1):
-            curr, nxt = op_names[i], op_names[i + 1]
-            # Skip edge if crossing layer boundary
-            if nodes[curr].annotations.get("layer_id") == nodes[nxt].annotations.get("layer_id"):
-                edges.append(Edge(src=curr, src_idx=0, dst=nxt, dst_idx=0))
-
-        # Attach collectives as JSON-safe dicts (no nodes - they're insert points)
-        from dataclasses import asdict
-        collectives = {c.name: asdict(c) for c in training_g.collectives}
-
-        # Generate name from model geometry
+        g = build_opgraph(model, strategy)
+        g.phase = phase
         model_desc = f"h{model.hidden}_l{len(model.layers)}"
-        return cls(
-            name=f"spec_{model_desc}_{phase}",
-            phase=phase,
-            nodes=nodes,
-            edges=edges,
-            metadata={
-                "source": "model_spec",
-                "hidden": model.hidden,
-                "layers": len(model.layers),
-                "strategy": str(strategy),
-                "collectives": collectives,
-            },
-        )
+        g.name = f"spec_{model_desc}_{phase}"
+        g.metadata["source"] = "model_spec"
+        g.metadata["strategy"] = str(strategy)
+        return g
 
     # ── hierarchy view ────────────────────────────────────────────────────────
 

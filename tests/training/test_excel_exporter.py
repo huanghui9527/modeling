@@ -8,8 +8,7 @@ from types import SimpleNamespace
 from openpyxl import load_workbook
 
 from zrt.training.io.excel_exporter import export_estimate_excel
-from zrt.training.ir.builders import build_graph
-from zrt.training.ir.training_graph import Collective
+from zrt.training.ir.opgraph_builder import build_opgraph
 from zrt.training.models.flops import op_cost
 from zrt.training.search.training_search_util import _make_system_from_config
 from zrt.training.spec.model import LayerKind, ModelSpec
@@ -105,8 +104,9 @@ def test_estimate_excel_summary_includes_operator_time_share(tmp_path):
         "world_size": 1,
     })
     strategy = Strategy()
-    graph = build_graph(model, strategy)
-    op_costs = {op.name: op_cost(op, model, system) for op in graph.ops}
+    graph = build_opgraph(model, strategy)
+    from zrt.training.models.flops import _iter_ops
+    op_costs = {op.name: op_cost(op, model, system) for op in _iter_ops(graph)}
 
     output_path = export_estimate_excel(
         report=TrainingReport(step_time_ms=100.0, compute_time_ms=50.0),
@@ -169,7 +169,7 @@ def test_estimate_excel_summary_labels_cp_by_actual_collective_kind(tmp_path):
     graph = SimpleNamespace(
         ops=[],
         collectives=[
-            Collective(name="cp_ring_fwd", kind="P2P", group="CP", bytes_=1024),
+            SimpleNamespace(name="cp_ring_fwd", kind="P2P", group="CP", bytes_=1024),
         ],
     )
 

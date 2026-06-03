@@ -2,8 +2,7 @@
 
 import pytest
 from zrt.hardware.spec import InterconnectSpec, LinkSpec
-from zrt.training.ir.training_graph import Collective
-from zrt.training.models.comm import collective_time, tier_for_group, total_comm_time
+from zrt.training.models.comm import CommSpec, collective_time, tier_for_group, total_comm_time
 from zrt.training.spec.system import SystemSpec, GPU
 
 
@@ -27,7 +26,7 @@ def _make_system():
 def test_p2p_time():
     """P2P: alpha + S * beta."""
     link = _intra_link()
-    c = Collective("test_p2p", "P2P", "PP", 1024 * 1024, "op1")  # 1 MB
+    c = CommSpec(kind="P2P", group="PP", bytes_=1024 * 1024, name="test_p2p")  # 1 MB
     t = collective_time(c, 2, link)
     assert t > 0
     # alpha = 1us; beta uses the unified effective bandwidth (peak ×
@@ -45,7 +44,7 @@ def test_ag_time():
     link = _intra_link()
     N = 8
     S = 100 * 1024 * 1024  # 100 MB
-    c = Collective("test_ag", "AG", "TP", S, "op1")
+    c = CommSpec(kind="AG", group="TP", bytes_=S, name="test_ag")
     t = collective_time(c, N, link)
 
     alpha = 1e-6  # all_to_all → switched_full → single-step latency
@@ -59,8 +58,8 @@ def test_ar_time_is_2x_ag():
     link = _intra_link()
     N = 8
     S = 50 * 1024 * 1024  # 50 MB
-    c_ag = Collective("ag", "AG", "TP", S, "op1")
-    c_ar = Collective("ar", "AR", "DP", S, "op1")
+    c_ag = CommSpec(kind="AG", group="TP", bytes_=S, name="ag")
+    c_ar = CommSpec(kind="AR", group="DP", bytes_=S, name="ar")
 
     t_ag = collective_time(c_ag, N, link)
     t_ar = collective_time(c_ar, N, link)
@@ -73,7 +72,7 @@ def test_a2a_time():
     link = _intra_link()
     N = 4
     S = 20 * 1024 * 1024
-    c = Collective("test_a2a", "A2A", "EP", S, "op1")
+    c = CommSpec(kind="A2A", group="EP", bytes_=S, name="test_a2a")
     t = collective_time(c, N, link)
 
     alpha = 1e-6
@@ -106,7 +105,7 @@ def test_dp_grad_reduce_zero3_uses_full_per_rank_volume():
     from zrt.training.spec.model import ModelSpec, LayerKind
     from zrt.training.spec.strategy import Strategy
     from zrt.training.models.comm import total_comm_time
-    from zrt.training.ir.builders import build_graph
+    from zrt.training.ir.opgraph_builder import build_opgraph
 
     model = ModelSpec(
         hidden=4096, ffn=16384, num_heads=32, num_kv_heads=32,
@@ -117,8 +116,8 @@ def test_dp_grad_reduce_zero3_uses_full_per_rank_volume():
     strategy_z1 = Strategy(tp=1, pp=1, dp=8, micro_batch=1, global_batch=8, zero_stage=1)
     strategy_z3 = Strategy(tp=1, pp=1, dp=8, micro_batch=1, global_batch=8, zero_stage=3)
 
-    g1 = build_graph(model, strategy_z1)
-    g3 = build_graph(model, strategy_z3)
+    g1 = build_opgraph(model, strategy_z1)
+    g3 = build_opgraph(model, strategy_z3)
     t_z1 = total_comm_time(g1, model, system, strategy_z1)["dp_grad_reduce"]
     t_z3 = total_comm_time(g3, model, system, strategy_z3)["dp_grad_reduce"]
 
@@ -158,11 +157,10 @@ def test_a2a_large_n_uses_log2_latency():
 
     For N=384, α=2µs: pairwise=766µs, Bruck=9·2µs=18µs."""
     from zrt.hardware.spec import LinkSpec
-    from zrt.training.ir.training_graph import Collective
     link = LinkSpec(type="IB", bandwidth_gbps=400, latency_us=2.0, topology="fat_tree")
     N = 384
     S = 1024 * 1024  # 1 MB
-    c = Collective("test_a2a", "A2A", "EP", S, "op1")
+    c = CommSpec(kind="A2A", group="EP", bytes_=S, name="test_a2a")
     t = collective_time(c, N, link)
 
     # Bandwidth term: (N-1)/N * S * β ≈ S * β for large N
@@ -187,7 +185,7 @@ def test_hierarchical_ag_beats_flat_for_multi_node():
     system = _make_system()  # 4 nodes × 8 gpus/node, inter=IB fat_tree
     N = 32  # multi-node group
     S = 100 * 1024 * 1024
-    c = Collective("test_hier", "AG", "DP", S, "op1")
+    c = CommSpec(kind="AG", group="DP", bytes_=S, name="test_hier")
     t_hier = collective_time_hierarchical(c, N, system)
     t_flat = collective_time(c, N, system.interconnect.inter_node)
     assert t_hier <= t_flat, (
@@ -202,7 +200,7 @@ def test_hierarchical_ag_falls_back_to_intra_within_node():
     system = _make_system()
     N = 8  # fits in one node
     S = 100 * 1024 * 1024
-    c = Collective("test_hier", "AG", "TP", S, "op1")
+    c = CommSpec(kind="AG", group="TP", bytes_=S, name="test_hier")
     t_hier = collective_time_hierarchical(c, N, system)
     t_intra = collective_time(c, N, system.interconnect.intra_node)
     assert t_hier == pytest.approx(t_intra, rel=1e-9)
@@ -212,12 +210,11 @@ def test_a2a_small_n_keeps_legacy_formula():
     """Small N (≤16) keeps pairwise-exchange (N-1)·(α+S/N·β) for backward-compat
     with intra-node A2A tests."""
     from zrt.hardware.spec import LinkSpec
-    from zrt.training.ir.training_graph import Collective
     link = LinkSpec(type="NVLink", bandwidth_gbps=900, latency_us=1.0,
                     topology="fat_tree", num_devices=8)  # not full_connectivity
     N = 8
     S = 1024 * 1024
-    c = Collective("test_a2a", "A2A", "TP", S, "op1")
+    c = CommSpec(kind="A2A", group="TP", bytes_=S, name="test_a2a")
     t = collective_time(c, N, link)
     alpha = 1e-6
     beta = 1.0 / link.effective_bw_bps(N)
@@ -239,7 +236,7 @@ def test_switched_tree_uses_log2_latency_vs_ring():
     N = 64
     tree = LinkSpec(type="IB", bandwidth_gbps=400, latency_us=5.0, topology="fat_tree")
     ring = LinkSpec(type="x", bandwidth_gbps=400, latency_us=5.0, topology="ring")
-    c = Collective("c", "AG", "DP", S, "op1")
+    c = CommSpec(kind="AG", group="DP", bytes_=S, name="c")
     t_tree = collective_time(c, N, tree)
     t_ring = collective_time(c, N, ring)
 
@@ -258,7 +255,7 @@ def test_unknown_topology_falls_back_to_ring():
     N = 16
     unk = LinkSpec(type="x", bandwidth_gbps=200, latency_us=3.0, topology="weird_fabric")
     ring = LinkSpec(type="x", bandwidth_gbps=200, latency_us=3.0, topology="ring")
-    c = Collective("c", "AR", "DP", S, "op1")
+    c = CommSpec(kind="AR", group="DP", bytes_=S, name="c")
     assert unk.topology_class == "ring"
     assert collective_time(c, N, unk) == pytest.approx(
         collective_time(c, N, ring), rel=1e-12
@@ -317,7 +314,7 @@ def test_clos_is_own_class_never_derates_keeps_log2_latency():
 
     # Latency: clos uses the switched-tree log2(N) law, not ring (N-1).
     S, N = 64 * 1024 * 1024, 64
-    c = Collective("c", "AG", "DP", S, "op1")
+    c = CommSpec(kind="AG", group="DP", bytes_=S, name="c")
     t = collective_time(c, N, clos)
     lat = t - S * (N - 1) / N / clos.effective_bw_bps(N)
     assert lat == pytest.approx(math.ceil(math.log2(N)) * 5e-6, rel=1e-6)
@@ -332,7 +329,7 @@ def test_clos_beats_fat_tree_at_scale_when_oversubscribed():
                     topology="clos", num_devices=0)
     ftree = LinkSpec(type="x", bandwidth_gbps=400, latency_us=5.0,
                      topology="fat_tree", num_devices=0, oversubscription=4.0)
-    c = Collective("c", "AR", "DP", S, "op1")
+    c = CommSpec(kind="AR", group="DP", bytes_=S, name="c")
     assert collective_time(c, N, clos) < collective_time(c, N, ftree)
 
 
@@ -413,7 +410,7 @@ def test_multi_tier_ag_decomposes_across_three_tiers():
 
     # AG cost: full cross-rack > rack-only > tray-only
     S = 64 * 1024 * 1024
-    c = Collective("ag_test", "AG", "DP", S, "op")
+    c = CommSpec(kind="AG", group="DP", bytes_=S, name="ag_test")
     t_64 = collective_time_multi_tier(c, ranks_in_rack, sys)
     t_128 = collective_time_multi_tier(c, ranks_cross_rack, sys)
     assert t_128 > t_64, (
@@ -431,7 +428,7 @@ def test_multi_tier_2tier_backcompat_matches_legacy_hierarchical():
     sys = _make_system()  # 2 tiers: intra (D=8), inter (unbounded)
     N = 32  # 4 nodes × 8
     S = 100 * 1024 * 1024
-    c = Collective("ag", "AG", "DP", S, "op")
+    c = CommSpec(kind="AG", group="DP", bytes_=S, name="ag")
     t_legacy = collective_time_hierarchical(c, N, sys)
     t_multi = collective_time_multi_tier(c, list(range(N)), sys)
     assert t_multi == pytest.approx(t_legacy, rel=1e-12), (
@@ -446,8 +443,8 @@ def test_multi_tier_ar_is_double_ag():
     sys = _make_3tier_system(world_size=512)
     ranks = list(range(128))
     S = 32 * 1024 * 1024
-    ag = Collective("ag", "AG", "DP", S, "op")
-    ar = Collective("ar", "AR", "DP", S, "op")
+    ag = CommSpec(kind="AG", group="DP", bytes_=S, name="ag")
+    ar = CommSpec(kind="AR", group="DP", bytes_=S, name="ar")
     t_ag = collective_time_multi_tier(ag, ranks, sys)
     t_ar = collective_time_multi_tier(ar, ranks, sys)
     # AR = RS + AG and RS has same cost as AG → factor 2
@@ -462,7 +459,7 @@ def test_multi_tier_picks_outermost_link_for_p2p():
     # Two ranks far apart → cross-rack → spine
     ranks = [0, 128]
     S = 1024 * 1024
-    c = Collective("p2p", "P2P", "PP", S, "op")
+    c = CommSpec(kind="P2P", group="PP", bytes_=S, name="p2p")
     t = collective_time_multi_tier(c, ranks, sys)
     # Should match flat P2P over spine link
     spine_link = sys.interconnect.tiers[-1].link
@@ -483,7 +480,7 @@ def test_hierarchical_a2a_never_worse_than_flat_inter():
     sys = _make_system()  # 4 nodes × 8 gpus/node
     N = 32  # multi-node EP group
     for S in (64 * 1024, 1024 * 1024, 50 * 1024 * 1024):
-        c = Collective("ep_a2a", "A2A", "EP", S, "op1")
+        c = CommSpec(kind="A2A", group="EP", bytes_=S, name="ep_a2a")
         t_hier = collective_time_hierarchical(c, N, sys)
         t_flat = collective_time(c, N, sys.interconnect.inter_node)
         assert t_hier <= t_flat + 1e-12, (
@@ -503,7 +500,7 @@ def test_hierarchical_a2a_strictly_faster_for_small_payloads():
     sys = _make_system()
     N = 256  # D=8 intra, L=32 inter — both use Bruck (N>16)
     S = 256 * 1024  # 256 KB — latency-dominated
-    c = Collective("ep_a2a_small", "A2A", "EP", S, "op1")
+    c = CommSpec(kind="A2A", group="EP", bytes_=S, name="ep_a2a_small")
     t_hier = collective_time_hierarchical(c, N, sys)
     t_flat = collective_time(c, N, sys.interconnect.inter_node)
     assert t_hier < t_flat, (
@@ -518,7 +515,7 @@ def test_hierarchical_a2a_matches_flat_intra_when_in_one_node():
     sys = _make_system()
     N = 8  # fits in one node
     S = 20 * 1024 * 1024
-    c = Collective("a2a", "A2A", "EP", S, "op1")
+    c = CommSpec(kind="A2A", group="EP", bytes_=S, name="a2a")
     t_hier = collective_time_hierarchical(c, N, sys)
     t_intra = collective_time(c, N, sys.interconnect.intra_node)
     assert t_hier == pytest.approx(t_intra, rel=1e-12)
@@ -536,11 +533,11 @@ def test_hierarchical_a2a_two_tier_formula():
     N, D = 256, 8
     L = N // D  # 32 — both intra and inter use Bruck
     S = 512 * 1024  # latency-dominated → hier strictly wins
-    c = Collective("a2a", "A2A", "EP", S, "op1")
+    c = CommSpec(kind="A2A", group="EP", bytes_=S, name="a2a")
     t_hier = collective_time_hierarchical(c, N, sys)
 
-    intra_c = Collective("a2a_intra", "A2A", "EP", S, "op1")
-    inter_c = Collective("a2a_inter", "A2A", "EP", S, "op1")
+    intra_c = CommSpec(kind="A2A", group="EP", bytes_=S, name="a2a_intra")
+    inter_c = CommSpec(kind="A2A", group="EP", bytes_=S, name="a2a_inter")
     t_intra = collective_time(intra_c, D, sys.interconnect.intra_node)
     t_inter = collective_time(inter_c, L, sys.interconnect.inter_node)
     t_sum = t_intra + t_inter
@@ -562,12 +559,12 @@ def test_multi_tier_a2a_decomposes_across_three_tiers():
     assert [d for d, _ in breakdown] == [4, 16, 2]
 
     S = 32 * 1024 * 1024
-    c = Collective("a2a", "A2A", "EP", S, "op1")
+    c = CommSpec(kind="A2A", group="EP", bytes_=S, name="a2a")
     t = collective_time_multi_tier(c, ranks, sys)
 
     # Expected: sum of A2A on each tier with full payload S at each.
     expected = sum(
-        collective_time(Collective(f"_t{d}", "A2A", "EP", S, "op1"), d, link)
+        collective_time(CommSpec(kind="A2A", group="EP", bytes_=S, name=f"_t{d}"), d, link)
         for d, link in breakdown
     )
     assert t == pytest.approx(expected, rel=1e-12)
@@ -582,7 +579,7 @@ def test_multi_tier_a2a_beats_flat_outer_for_cross_tier_group():
     sys = _make_3tier_system(world_size=512)
     ranks = list(range(128))  # crosses spine
     S = 32 * 1024 * 1024
-    c = Collective("a2a", "A2A", "EP", S, "op1")
+    c = CommSpec(kind="A2A", group="EP", bytes_=S, name="a2a")
     t_hier = collective_time_multi_tier(c, ranks, sys)
     # Old behavior: flat A2A on outermost spine link with N=128
     spine_link = sys.interconnect.tiers[-1].link
@@ -598,17 +595,21 @@ def test_comm_domain_routes_a2a_through_hierarchical_on_2tier():
     collective_time_hierarchical (not flat collective_time), so a
     multi-node EP group benefits from intra+inter decomposition."""
     from zrt.training.models.comm import (
-        collective_time_hierarchical, total_comm_time,
+        collective_time_hierarchical, total_comm_time, CommSpec,
     )
     from zrt.training.spec.model import ModelSpec, LayerKind
     from zrt.training.spec.strategy import Strategy
-    from zrt.training.ir.training_graph import Graph, Collective as Col
+    from zrt.ir.node import OpNode
+    from zrt.ir.graph import OpGraph
 
     sys = _make_system()  # 2-tier H100-style
     S = 8 * 1024 * 1024
-    a2a = Col(name="ep_a2a", kind="A2A", group="EP", bytes_=S,
-              inserted_after="op")
-    graph = Graph(ops=[], collectives=[a2a])
+    node = OpNode(
+        id="ep_a2a", op_type="comm.all_to_all",
+        attrs={"comm_group": "EP", "comm_bytes": S},
+        category="communication", name="ep_a2a",
+    )
+    graph = OpGraph(name="test", phase="forward", nodes={"ep_a2a": node})
     model = ModelSpec(
         hidden=512, ffn=2048, num_heads=8, num_kv_heads=8,
         head_dim=64, vocab=1024, seq_len=128,
@@ -620,18 +621,19 @@ def test_comm_domain_routes_a2a_through_hierarchical_on_2tier():
     )
     result = total_comm_time(graph, model, sys, strategy)
     # Expected: hierarchical A2A over 16 ranks (D=8 intra, L=2 inter)
-    expected = collective_time_hierarchical(a2a, 16, sys)
+    a2a_spec = CommSpec(kind="A2A", group="EP", bytes_=S, name="ep_a2a")
+    expected = collective_time_hierarchical(a2a_spec, 16, sys)
     assert result["ep_a2a"] == pytest.approx(expected, rel=1e-12)
     # Sanity: hierarchical must be strictly less than flat-inter for
     # this cross-node group.
-    flat_inter = collective_time(a2a, 16, sys.interconnect.inter_node)
+    flat_inter = collective_time(a2a_spec, 16, sys.interconnect.inter_node)
     assert expected < flat_inter
 
 
 def test_total_comm_time_uses_multi_tier_when_3plus_tiers():
     """End-to-end: total_comm_time picks the multi-tier path automatically
     when the system has 3+ interconnect tiers."""
-    from zrt.training.ir.training_graph import Graph
+    from zrt.ir.graph import OpGraph
     from zrt.training.models.comm import total_comm_time
     from zrt.training.spec.strategy import Strategy
 
@@ -645,7 +647,7 @@ def test_total_comm_time_uses_multi_tier_when_3plus_tiers():
         head_dim=64, vocab=1024, seq_len=128,
         layers=[LayerKind.DENSE] * 4,
     )
-    graph = Graph(ops=[], collectives=[])
+    graph = OpGraph(name="test", phase="forward")
     result = total_comm_time(graph, model, sys, strategy)
     # DP grad reduce should be priced > 0 (8 ranks at stride tp*cp*pp = 64 →
     # group spans across racks, hits spine).

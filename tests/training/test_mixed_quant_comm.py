@@ -7,7 +7,7 @@ from zrt.training.spec.model import LayerKind, ModelSpec
 from zrt.training.spec.strategy import OptKind, Strategy
 from zrt.training.spec.system import GPU, SystemSpec
 from zrt.hardware.spec import InterconnectSpec, LinkSpec
-from zrt.training.ir.training_graph import Graph
+from zrt.ir.graph import OpGraph
 
 
 def _make_system(dp_bw_gbps=900):
@@ -31,7 +31,7 @@ def _moe_model():
 
 def test_dp_grad_reduce_smaller_under_ep_than_under_no_ep():
     """When EP > 1, routed expert grads are EP-local and excluded from DP AR."""
-    g, sys_ = Graph(), _make_system()
+    g, sys_ = OpGraph(name="", phase=""), _make_system()
     m = _moe_model()
     st_no_ep = Strategy(dp=2, ep=1, optimizer=OptKind.ADAM)
     st_ep    = Strategy(dp=2, ep=4, optimizer=OptKind.ADAM)
@@ -44,7 +44,7 @@ def test_dp_grad_reduce_smaller_under_ep_than_under_no_ep():
 
 
 def test_dp_grad_reduce_volume_unchanged_for_dense_model():
-    g, sys_ = Graph(), _make_system()
+    g, sys_ = OpGraph(name="", phase=""), _make_system()
     m_dense = ModelSpec(
         hidden=512, ffn=2048, num_heads=8, num_kv_heads=8, head_dim=64,
         vocab=4096, seq_len=128, layers=[LayerKind.DENSE, LayerKind.DENSE],

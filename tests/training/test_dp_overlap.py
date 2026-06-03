@@ -6,7 +6,7 @@ from zrt.training.compose.schedules import (
     DualPipeComposer, DualPipeVComposer, pipeline_step_time,
 )
 from zrt.training.compose.stage import StageTime
-from zrt.training.ir.builders import build_graph
+from zrt.training.ir.opgraph_builder import build_opgraph
 from zrt.training.spec.model import ModelSpec, LayerKind
 from zrt.training.spec.strategy import Strategy, PPSched
 from zrt.hardware.spec import InterconnectSpec, LinkSpec
@@ -85,7 +85,7 @@ class TestDualbatchRecoversWithSteadyOverlap:
         s = Strategy(tp=1, pp=2, dp=4, micro_batch=1, global_batch=4,
                      pp_schedule=PPSched.DUALPIPE, dualbatch=True,
                      dp_steady_overlap_ratio=0.0)
-        graph = build_graph(model, s)
+        graph = build_opgraph(model, s)
         result = pipeline_step_time(graph, model, _make_system(), s)
         # pp=2 DualPipe: (PP/2-1)*(F&B+B-3W) = 0 → zero bubble → cooldown=0
         assert result.cooldown == pytest.approx(0.0, abs=1e-12)
@@ -98,7 +98,7 @@ class TestDualbatchRecoversWithSteadyOverlap:
         s = Strategy(tp=1, pp=2, dp=4, micro_batch=1, global_batch=4,
                      pp_schedule=PPSched.DUALPIPE, dualbatch=True,
                      dp_steady_overlap_ratio=0.5)
-        graph = build_graph(model, s)
+        graph = build_opgraph(model, s)
         result = pipeline_step_time(graph, model, _make_system(), s)
         # With ratio>0, dp_hidden > 0 even though dualbatch zeroed cooldown
         assert result.dp_hidden > 0.0, \
@@ -161,7 +161,7 @@ class TestHideWindowConsistency:
         s = Strategy(tp=1, pp=2, dp=4, micro_batch=4, global_batch=64,
                      pp_schedule=PPSched.DUALPIPE, dualbatch=True,
                      dp_steady_overlap_ratio=1.0)
-        graph = build_graph(model, s)
+        graph = build_opgraph(model, s)
         result = pipeline_step_time(graph, model, _make_system(), s)
         # With ratio=1.0 and steady_bwd >> dp_total, DP should be ~fully hidden.
         assert result.dp_hidden > 0.5 * (result.dp_exposed + result.dp_hidden), \
@@ -189,7 +189,7 @@ class TestLastBucketResidual:
                      zero_stage=1, pp_schedule=sched,
                      dp_overlap_in_bubble=True, dp_steady_overlap_ratio=0.5,
                      dp_grad_buckets=25)
-        r = pipeline_step_time(build_graph(model, s), model, _make_system(), s)
+        r = pipeline_step_time(build_opgraph(model, s), model, _make_system(), s)
         total_dp = r.dp_exposed + r.dp_hidden
         assert total_dp > 0.0
         assert r.dp_exposed > 0.0, \
@@ -238,7 +238,7 @@ class TestDualbatchBubbleFloor:
         # Large M to confirm bubble doesn't get "filled" by steady work.
         s = Strategy(tp=1, pp=4, dp=2, micro_batch=1, global_batch=256,
                      pp_schedule=PPSched.ONE_F_ONE_B, dualbatch=True)
-        graph = build_graph(model, s)
+        graph = build_opgraph(model, s)
         result = pipeline_step_time(graph, model, _make_system(), s)
         assert result.bubble_fraction > 0.0, (
             "dualbatch must not zero the pipeline bubble; got "
@@ -256,7 +256,7 @@ class TestDualbatchBubbleFloor:
         s = Strategy(tp=1, pp=4, dp=2, micro_batch=1, global_batch=256,
                      pp_schedule=PPSched.DUALPIPE_V, vpp_chunks=2,
                      dualbatch=True)
-        graph = build_graph(model, s)
+        graph = build_opgraph(model, s)
         result = pipeline_step_time(graph, model, _make_system(), s)
         # Composer gives bubble = (pp-1)/(2V) · t_stage > 0; dualbatch must
         # leave it alone.
@@ -280,7 +280,7 @@ class TestPPHiddenAccounting:
                           layers=[LayerKind.DENSE] * 2)
         s = Strategy(tp=1, pp=2, dp=1, micro_batch=1, global_batch=4,
                      pp_schedule=PPSched.DUALPIPE, pp_overlap=True)
-        graph = build_graph(model, s)
+        graph = build_opgraph(model, s)
 
         def fake_stage_time(*args, **kwargs):
             return StageTime(fwd=1.0, bwd=1.0, bwd_dx=0.0, bwd_dw=1.0)
@@ -305,7 +305,7 @@ class TestPPHiddenAccounting:
                           layers=[LayerKind.DENSE] * 2)
         s = Strategy(tp=1, pp=2, dp=1, micro_batch=1, global_batch=4,
                      pp_schedule=PPSched.DUALPIPE, pp_overlap=True)
-        graph = build_graph(model, s)
+        graph = build_opgraph(model, s)
 
         def fake_stage_time(*args, **kwargs):
             return StageTime(
@@ -336,7 +336,7 @@ class TestPPHiddenAccounting:
                           layers=[LayerKind.DENSE] * 2)
         s = Strategy(tp=1, pp=2, dp=1, micro_batch=1, global_batch=4,
                      pp_schedule=PPSched.DUALPIPE)  # pp_overlap defaults False
-        graph = build_graph(model, s)
+        graph = build_opgraph(model, s)
 
         def fake_stage_time(*args, **kwargs):
             return StageTime(fwd=1.0, bwd=1.0, bwd_dx=0.0, bwd_dw=1.0)
@@ -362,7 +362,7 @@ class TestPPHiddenAccounting:
         s = Strategy(tp=1, pp=2, dp=1, micro_batch=1, global_batch=4,
                      pp_schedule=PPSched.DUALPIPE_V, vpp_chunks=2,
                      pp_overlap=True)
-        graph = build_graph(model, s)
+        graph = build_opgraph(model, s)
 
         def fake_stage_time(*args, **kwargs):
             return StageTime(fwd=1.0, bwd=1.0, bwd_dx=0.0, bwd_dw=0.3)

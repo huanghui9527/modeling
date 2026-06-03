@@ -280,7 +280,6 @@ def test_ep_a2a_bytes_with_tp():
     strategy = Strategy(tp=4, pp=1, dp=1, ep=2, micro_batch=1)
     graph = build_graph(model, strategy)
 
-    # mb=1, seq=2048, h/tp=4096/4=1024, topk=2, act=bf16(2)
     expected_bytes = (
         strategy.micro_batch * model.seq_len
         * (model.hidden // 4) * model.top_k * model.act_dtype.bytes
@@ -289,7 +288,7 @@ def test_ep_a2a_bytes_with_tp():
     for c in graph.collectives:
         if c.group == "EP" and c.kind == "A2A":
             assert c.bytes_ == expected_bytes, (
-                f"EP A2A bytes should be {expected_bytes} (with TP=4), got {c.bytes_}"
+                f"EP A2A bytes should be {expected_bytes} (hidden/tp), got {c.bytes_}"
             )
 
 

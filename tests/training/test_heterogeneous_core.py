@@ -9,6 +9,7 @@ Validates:
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,11 +17,34 @@ from zrt.hardware import load as hw_load
 from zrt.hardware.spec import ComputeSpec
 from zrt.training.compose.stage import op_to_time, op_to_time_hetero
 from zrt.training.io.perf_tables import achieved_flops_efficiency
-from zrt.training.ir.training_graph import Op
 from zrt.training.models.flops import OpCost, op_cost
 from zrt.training.spec.dtype import Dtype
 from zrt.hardware.spec import InterconnectSpec, LinkSpec
 from zrt.training.spec.system import GPU, SystemSpec
+
+
+class _FakeTensor:
+    """Lightweight stand-in for legacy ``Tensor`` (new-IR migration)."""
+    __slots__ = ("name", "shape_logical", "shape_local", "dtype",
+                 "is_activation", "is_param")
+
+    def __init__(self, *, name, shape_logical, shape_local, dtype,
+                 is_activation=True, is_param=False):
+        self.name = name
+        self.shape_logical = shape_logical
+        self.shape_local = shape_local
+        self.dtype = dtype
+        self.is_activation = is_activation
+        self.is_param = is_param
+
+    def num_elements(self) -> int:
+        r = 1
+        for d in self.shape_local:
+            r *= d
+        return r
+
+    def nbytes(self) -> int:
+        return self.num_elements() * self.dtype.bytes
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -103,8 +127,8 @@ class TestOpCostSplit:
         return m
 
     def test_matmul_pure_cube(self):
-        op = Op(name="qkv_proj", kind="matmul", inputs=[], outputs=[],
-                meta={"m": 4, "n": 4096, "k": 4096})
+        op = SimpleNamespace(name="qkv_proj", kind="matmul", inputs=[], outputs=[],
+                meta={"m": 4, "n": 4096, "k": 4096}, component=None)
         cost = op_cost(op, self._mock_model())
         expected = 2 * 4 * 4096 * 4096
         assert cost.fwd_cube_flops == expected
@@ -113,8 +137,8 @@ class TestOpCostSplit:
         assert cost.dx_vector_flops == 0.0
 
     def test_lm_head_pure_cube(self):
-        op = Op(name="lm_head", kind="lm_head", inputs=[], outputs=[],
-                meta={"m": 4, "n": 32000, "k": 4096})
+        op = SimpleNamespace(name="lm_head", kind="lm_head", inputs=[], outputs=[],
+                meta={"m": 4, "n": 32000, "k": 4096}, component=None)
         cost = op_cost(op, self._mock_model())
         expected = 2 * 4 * 32000 * 4096
         assert cost.fwd_cube_flops == expected
@@ -122,8 +146,9 @@ class TestOpCostSplit:
 
     def test_attn_core_explicit_split(self):
         b, s, h, d = 2, 1024, 32, 128
-        op = Op(name="attn", kind="attn_core", inputs=[], outputs=[],
-                meta={"b": b, "s": s, "heads": h, "head_dim": d, "causal": True})
+        op = SimpleNamespace(name="attn", kind="attn_core", inputs=[], outputs=[],
+                meta={"b": b, "s": s, "heads": h, "head_dim": d, "causal": True},
+                component=None)
         cost = op_cost(op, self._mock_model())
 
         expected_fwd = 2 * b * s * s * h * d  # causal: 2*mult
@@ -137,10 +162,8 @@ class TestOpCostSplit:
         assert cost.dx_vector_flops == 2.5 * expected_vector
 
     def test_elementwise_pure_vector(self):
-        from zrt.training.ir.training_graph import Tensor
-        from zrt.training.spec.dtype import Dtype
-        op = Op(name="layernorm", kind="ln", inputs=[], outputs=[
-            Tensor(name="out", shape_logical=(1, 128, 4096), shape_local=(1, 128, 4096),
+        op = SimpleNamespace(name="layernorm", kind="ln", inputs=[], outputs=[
+            _FakeTensor(name="out", shape_logical=(1, 128, 4096), shape_local=(1, 128, 4096),
                    dtype=Dtype.BF16, is_activation=True),
         ], meta={})
         cost = op_cost(op, self._mock_model())
@@ -149,7 +172,7 @@ class TestOpCostSplit:
         assert cost.dx_vector_flops > 0
 
     def test_unknown_op_pure_cube_fallback(self):
-        op = Op(name="custom_op", kind="unknown_kind", inputs=[], outputs=[],
+        op = SimpleNamespace(name="custom_op", kind="unknown_kind", inputs=[], outputs=[],
                 meta={})
         cost = op_cost(op, self._mock_model())
         # Unknown ops return OpCost() with all zeros

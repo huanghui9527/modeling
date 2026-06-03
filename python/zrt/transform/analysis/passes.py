@@ -147,7 +147,10 @@ class FlopsPass(GraphPass):
         dx_flops = 0.0
         dw_flops = 0.0
 
-        if op_type.startswith("aten.mm") or op_type.startswith("aten.linear") or op_type.startswith("aten.addmm"):
+        if op_type == "mega_moe":
+            dx_flops = fwd_flops
+            dw_flops = fwd_flops
+        elif op_type.startswith("aten.mm") or op_type.startswith("aten.linear") or op_type.startswith("aten.addmm"):
             dx_flops = fwd_flops
             dw_flops = fwd_flops
         elif _is_attention_op(op_type):
@@ -210,6 +213,93 @@ def _effective_compute_dtype(node: "OpNode") -> "DType":
     if not node.inputs:
         return node.outputs[0].dtype if node.outputs else DType.BF16
     return node.inputs[0].dtype
+
+
+def _mega_moe_internal_comm_us(node, ctx, base_latency_us: float) -> tuple[float, dict]:
+    if (
+        node.op_type != "mega_moe"
+        and not node.annotations.get("mega_moe_internal_comm")
+    ) or ctx.training is None:
+        return 0.0, {}
+
+    meta = node.annotations.get("mega_moe_meta") or node.attrs.get("mega_moe_meta")
+    if not meta:
+        return 0.0, {}
+
+    from zrt.training.models.mega_moe import (
+        _mega_moe_combine_bytes,
+        _mega_moe_dispatch_bytes,
+        mega_moe_cost_terms_from_meta,
+        resolve_mega_moe_waves,
+        select_mega_moe_waves_by_pipeline,
+        simulate_wave_pipeline,
+    )
+    from python.zrt.transform.analysis.comm_latency import _estimate_comm_latency
+
+    ep = max(1, int(meta.get("ep", getattr(ctx.parallel, "ep", 1))))
+    if ep <= 1:
+        return 0.0, {}
+
+    hw = ctx.hw_spec
+    if hw is None:
+        return 0.0, {}
+
+    intra_devices = hw.interconnect.intra_node.num_devices
+    link = hw.interconnect.inter_node if ep > intra_devices else hw.interconnect.intra_node
+    bandwidth_bps = link.effective_bw_bps(ep)
+
+    terms = mega_moe_cost_terms_from_meta(meta)
+    dispatch_bytes = int(_mega_moe_dispatch_bytes(terms, ep))
+    combine_bytes = int(_mega_moe_combine_bytes(terms, ep))
+    dispatch_us = _estimate_comm_latency(
+        "all_to_all", ep, dispatch_bytes, bandwidth_bps, link.latency_us,
+    )
+    combine_us = _estimate_comm_latency(
+        "all_to_all", ep, combine_bytes, bandwidth_bps, link.latency_us,
+    )
+
+    requested = int(meta.get("requested_waves", ctx.training.mega_moe_waves))
+    experts_per_rank = int(meta.get("experts_per_rank", terms.local_experts))
+    if requested > 0:
+        waves = resolve_mega_moe_waves(
+            requested=requested,
+            hardware_waves=int(getattr(hw.compute, "ep_overlap_waves", 0)),
+            experts_per_rank=experts_per_rank,
+        )
+    else:
+        waves = select_mega_moe_waves_by_pipeline(
+            experts_per_rank=experts_per_rank,
+            fwd_compute_s=base_latency_us / 1e6,
+            bwd_compute_s=base_latency_us / 1e6,
+            dispatch_s=dispatch_us / 1e6,
+            combine_s=combine_us / 1e6,
+        )
+    if waves <= 1:
+        pipeline = simulate_wave_pipeline(
+            waves=1,
+            dispatch_s=dispatch_us / 1e6,
+            compute_s=base_latency_us / 1e6,
+            combine_s=combine_us / 1e6,
+        )
+    else:
+        pipeline = simulate_wave_pipeline(
+            waves=waves,
+            dispatch_s=dispatch_us / waves / 1e6,
+            compute_s=base_latency_us / waves / 1e6,
+            combine_s=combine_us / waves / 1e6,
+        )
+
+    exposed_us = pipeline.exposed_comm_s * 1e6
+    return exposed_us, {
+        "mega_moe_dispatch_us": dispatch_us,
+        "mega_moe_combine_us": combine_us,
+        "mega_moe_exposed_comm_us": exposed_us,
+        "mega_moe_hidden_comm_us": pipeline.hidden_comm_s * 1e6,
+        "mega_moe_internal_comm_us": pipeline.comm_total_s * 1e6,
+        "mega_moe_effective_waves": waves,
+        "mega_moe_dispatch_bytes": dispatch_bytes,
+        "mega_moe_combine_bytes": combine_bytes,
+    }
 
 
 class RooflinePass(GraphPass):
@@ -300,6 +390,12 @@ class RooflinePass(GraphPass):
             else:
                 final_latency_us = 0.0
 
+            mega_moe_exposed_us, mega_moe_annotations = _mega_moe_internal_comm_us(
+                node, ctx, base_latency_us,
+            )
+            if mega_moe_annotations:
+                final_latency_us += mega_moe_exposed_us
+
             total_b = base_total_b + saved_activation_b
             ai = base_flops / total_b if total_b > 0 else math.inf
 
@@ -325,6 +421,7 @@ class RooflinePass(GraphPass):
             node.annotations["recompute_latency_us"] = recompute_latency_us
             node.annotations["arithmetic_intensity"] = ai
             node.annotations["bound"]                = bound
+            node.annotations.update(mega_moe_annotations)
             # Respect pre-existing latency_us (e.g. from profiling or test injection)
             # BUT for backward nodes, always recalculate to include recompute_latency
             if "latency_us" not in node.annotations or is_bwd:

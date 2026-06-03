@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from zrt.hardware.spec import LinkSpec
-from zrt.training.ir.training_graph import Collective
+from zrt.training.models.comm import CommSpec
 from zrt.training.spec.strategy import Strategy
 from zrt.training.spec.system import SystemSpec
 
@@ -211,7 +211,7 @@ class CommDomain:
 
     # ─ Pricing ──────────────────────────────────────────────────────
 
-    def time(self, c: Collective) -> float:
+    def time(self, c: CommSpec) -> float:
         """Cost ``c`` using the appropriate tier-aware path.
 
         Dispatch:
@@ -271,14 +271,14 @@ class CommDomain:
             return collective_time_hierarchical(c, size, self.system)
         return collective_time(c, size, self.link(c.group))
 
-    def time_ar(self, c: Collective) -> float:
+    def time_ar(self, c: CommSpec) -> float:
         """Convenience: AR cost regardless of ``c.kind`` (treat as AR).
 
         Some call sites pass an AR-volumed collective tagged as RS to
         signal ZeRO≥1. This explicit helper avoids hijacking the kind
         field for that purpose.
         """
-        ar_c = Collective(name=c.name, kind="AR", group=c.group, bytes_=c.bytes_)
+        ar_c = CommSpec(kind="AR", group=c.group, bytes_=c.bytes_, name=c.name)
         return self.time(ar_c)
 
     # ─ Debug ────────────────────────────────────────────────────────

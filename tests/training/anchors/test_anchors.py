@@ -46,7 +46,7 @@ def test_anchor_config_is_internally_consistent(yaml_file):
     data = _load_anchor(yaml_file)
     config = data["config"]
     name = data["name"]
-    _, system, _ = load_anchor_config(yaml_file)
+    _, system, _, _ = load_anchor_config(yaml_file)
 
     tp = config.get("tp", 1)
     pp = config.get("pp", 1)
@@ -98,7 +98,7 @@ def test_anchor_estimate_integration():
     calibration_results = []
 
     for yaml_file in sorted(ANCHOR_DIR.glob("*.yaml")):
-        model, system, strategy = load_anchor_config(yaml_file)
+        model, system, strategy, _ = load_anchor_config(yaml_file)
         anchor_data = _load_anchor(yaml_file)
         anchor = Anchor(name=anchor_data["name"], **anchor_data["targets"])
 
@@ -156,7 +156,7 @@ def test_anchor_mfu_strict():
     failures = []
 
     for yaml_file in sorted(ANCHOR_DIR.glob("*.yaml")):
-        model, system, strategy = load_anchor_config(yaml_file)
+        model, system, strategy, _ = load_anchor_config(yaml_file)
         anchor_data = _load_anchor(yaml_file)
         targets = anchor_data["targets"]
         anchor_mfu = targets.get("mfu", 0)
@@ -211,8 +211,10 @@ def test_anchor_step_time_strict():
             print(f"{anchor_data['name']}: step_time SKIPPED (calibration mode)")
             continue
 
-        model, system, strategy = load_anchor_config(yaml_file)
-        report = estimate(model, system, strategy)
+        from zrt.training.ir.opgraph_builder import build_opgraph
+        model, system, strategy, _ = load_anchor_config(yaml_file)
+        graph = build_opgraph(model, strategy)
+        report = estimate(model, system, strategy, graph=graph)
         rel_diff = abs(report.step_time_ms - anchor_step_time) / anchor_step_time
 
         print(f"{anchor_data['name']}: step_time={report.step_time_ms:.1f}ms "
@@ -250,8 +252,8 @@ def test_anchor_fp8_fp4_h100_faster_than_bf16():
     from zrt.training.io.config_loader import load_anchor_config
     from zrt.training.search.estimator import estimate
 
-    m_q, s_q, st_q = load_anchor_config(_FP8_FP4_H100_ANCHOR)
-    m_b, s_b, st_b = load_anchor_config(_BF16_BASELINE_ANCHOR)
+    m_q, s_q, st_q, _ = load_anchor_config(_FP8_FP4_H100_ANCHOR)
+    m_b, s_b, st_b, _ = load_anchor_config(_BF16_BASELINE_ANCHOR)
     rep_q = estimate(m_q, s_q, st_q)
     rep_b = estimate(m_b, s_b, st_b)
     assert rep_q.step_time_ms < rep_b.step_time_ms, (
@@ -271,8 +273,8 @@ def test_anchor_fp8_fp4_h100_peak_memory_lower():
     from zrt.training.io.config_loader import load_anchor_config
     from zrt.training.search.estimator import estimate
 
-    m_q, s_q, st_q = load_anchor_config(_FP8_FP4_H100_ANCHOR)
-    m_b, s_b, st_b = load_anchor_config(_BF16_BASELINE_ANCHOR)
+    m_q, s_q, st_q, _ = load_anchor_config(_FP8_FP4_H100_ANCHOR)
+    m_b, s_b, st_b, _ = load_anchor_config(_BF16_BASELINE_ANCHOR)
     rep_q = estimate(m_q, s_q, st_q)
     rep_b = estimate(m_b, s_b, st_b)
     peak_q = rep_q.memory.peak_overall
@@ -288,8 +290,8 @@ def test_anchor_fp8_fp4_b300_faster_than_h100():
     from zrt.training.io.config_loader import load_anchor_config
     from zrt.training.search.estimator import estimate
 
-    m_h, s_h, st_h = load_anchor_config(_FP8_FP4_H100_ANCHOR)
-    m_b, s_b, st_b = load_anchor_config(_FP8_FP4_B300_ANCHOR)
+    m_h, s_h, st_h, _ = load_anchor_config(_FP8_FP4_H100_ANCHOR)
+    m_b, s_b, st_b, _ = load_anchor_config(_FP8_FP4_B300_ANCHOR)
     rep_h = estimate(m_h, s_h, st_h)
     rep_b = estimate(m_b, s_b, st_b)
     assert rep_b.step_time_ms < rep_h.step_time_ms, (

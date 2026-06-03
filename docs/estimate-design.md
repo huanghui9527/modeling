@@ -964,4 +964,3 @@ PYTHONPATH=python:. python -m python.zrt --estimate-config python/zrt/training/c
 3. **Phase-aware backward**：dx 和 dw 分离，支持 ZeroBubble 等精细调度
 4. **Heterogeneous compute**：H100 Cube/Vector 双峰值，fallback 到统一峰值
 5. **Invariant-preserving**：StepResult 的 timing 分解有严格代数不变量，可在 pipeline_step_time() 中验证
-

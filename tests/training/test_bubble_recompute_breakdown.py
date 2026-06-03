@@ -2,12 +2,12 @@
 
 RED→GREEN regression for:
   1. StepResult.bubble = warmup + cooldown (absolute seconds), 0 when pp=1.
-  2. StepResult.recompute_critical = 0 with no recompute policy, > 0 when
+  2. StepResult.recompute_time = 0 with no recompute policy, > 0 when
      full/partial recompute is enabled.
   3. bubble attributed OUT of compute_time:
      pipeline_time == compute_time + exposed_comm + bubble
   4. recompute attributed OUT of bwd_compute:
-     compute_time == fwd_compute + bwd_compute + recompute_critical
+     compute_time == fwd_compute + bwd_compute + recompute_time
   5. step_time identity preserved (attribution does not change totals).
 """
 
@@ -18,7 +18,7 @@ import pytest
 
 from zrt.training.compose.schedules import OneF1BComposer, pipeline_step_time
 from zrt.training.compose.stage import StageTime
-from zrt.training.ir.builders import build_graph
+from zrt.training.ir.opgraph_builder import build_opgraph
 from zrt.training.spec.model import ModelSpec, LayerKind
 from zrt.training.spec.strategy import Strategy, RecomputePolicy
 from zrt.hardware.spec import InterconnectSpec, LinkSpec
@@ -73,7 +73,7 @@ def test_bubble_zero_when_single_stage():
 def test_recompute_time_zero_without_policy():
     model, system = _model(), _system()
     strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1, global_batch=4)
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
 
     step = pipeline_step_time(graph, model, system, strategy)
 
@@ -86,7 +86,8 @@ def test_recompute_time_positive_with_full_recompute():
         tp=1, pp=1, dp=1, micro_batch=1, global_batch=4,
         recompute=RecomputePolicy(per_layer={"dense": {"full"}}),
     )
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
+
     step = pipeline_step_time(graph, model, system, strategy)
 
     assert step.recompute_critical > 0.0
@@ -98,7 +99,7 @@ def test_recompute_excluded_from_bwd_compute_invariant():
         tp=1, pp=1, dp=1, micro_batch=1, global_batch=4,
         recompute=RecomputePolicy(per_layer={"dense": {"full"}}),
     )
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
 
     step = pipeline_step_time(graph, model, system, strategy)
 
@@ -115,7 +116,7 @@ def test_recompute_excluded_from_bwd_compute_invariant():
 def test_pipeline_bubble_excluded_from_compute_time_invariant():
     model, system = _model(), _system()
     strategy = Strategy(tp=1, pp=2, dp=4, micro_batch=1, global_batch=8)
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
 
     step = pipeline_step_time(graph, model, system, strategy)
 
@@ -131,7 +132,7 @@ def test_pipeline_bubble_excluded_from_compute_time_invariant():
 def test_recompute_raw_zero_without_policy():
     model, system = _model(), _system()
     strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1, global_batch=4)
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
 
     step = pipeline_step_time(graph, model, system, strategy)
 
@@ -163,8 +164,8 @@ def test_dense_recompute_pipeline_hidden_raw_visible():
                   recompute=RecomputePolicy(per_layer={"dense": {"attn_block"}}))
     no_rc = Strategy(**common)
 
-    g_rc = build_graph(model, rc)
-    g_no = build_graph(model, no_rc)
+    g_rc = build_opgraph(model, rc)
+    g_no = build_opgraph(model, no_rc)
     s_rc = pipeline_step_time(g_rc, model, system, rc)
     s_no = pipeline_step_time(g_no, model, system, no_rc)
 
@@ -191,7 +192,7 @@ def test_recompute_attribution_preserves_step_time():
         tp=1, pp=2, dp=1, micro_batch=1, global_batch=8,
         recompute=RecomputePolicy(per_layer={"dense": {"full"}}),
     )
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
 
     step = pipeline_step_time(graph, model, system, strategy)
 
@@ -214,7 +215,7 @@ def test_recompute_critical_path_does_not_include_pipeline_bubble():
         tp=1, pp=2, dp=1, micro_batch=1, global_batch=8,
         recompute=RecomputePolicy(per_layer={"dense": {"full"}}),
     )
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
 
     step = pipeline_step_time(graph, model, system, strategy)
     s_bot = max(step.per_stage, key=lambda st: st.fwd + st.bwd)
@@ -228,7 +229,7 @@ def test_html_export_surfaces_recompute_and_bubble():
     """The HTML report must visibly carry recompute + bubble: JS constants,
     the metric cards, and the step-time breakdown section."""
     from zrt.training.io.html_exporter import export_estimate_html
-    from zrt.training.models.flops import op_cost
+    from zrt.training.models.flops import op_cost, _iter_ops
 
     model, system = _model(), _system()
     # TP*CP*PP*DP must equal world_size (8) for estimate()'s validate().
@@ -236,10 +237,10 @@ def test_html_export_surfaces_recompute_and_bubble():
         tp=1, cp=1, pp=2, ep=1, dp=4, micro_batch=1, global_batch=8,
         recompute=RecomputePolicy(per_layer={"dense": {"full"}}),
     )
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
     from zrt.training.search.estimator import estimate
     report = estimate(model, system, strategy, graph=graph)
-    op_costs = {op.name: op_cost(op, model, system) for op in graph.ops}
+    op_costs = {op.name: op_cost(op, model, system) for op in _iter_ops(graph)}
 
     out_dir = Path("output") / "test_html_bubble_recompute"
     if out_dir.exists():
@@ -269,12 +270,14 @@ def test_search_report_surfaces_bubble_and_recompute():
     from zrt.training.search.estimator import estimate
     from zrt.training.search.report import report_to_dict, report_summary
 
+    from zrt.training.ir.opgraph_builder import build_opgraph
     model, system = _model(), _system()
     strategy = Strategy(
         tp=1, cp=1, pp=2, ep=1, dp=4, micro_batch=1, global_batch=8,
         recompute=RecomputePolicy(per_layer={"dense": {"full"}}),
     )
-    report = estimate(model, system, strategy)
+    graph = build_opgraph(model, strategy)
+    report = estimate(model, system, strategy, graph=graph)
 
     d = report_to_dict(report)
     for key in ("bubble_time_ms", "recompute_critical_ms", "recompute_raw_mag_ms"):
@@ -305,6 +308,7 @@ def test_search_results_table_has_recompute_columns():
     results table (results_summary.csv / printed top-5 / best-config Excel
     grouping) from silently dropping recompute time again.
     """
+    from zrt.training.ir.opgraph_builder import build_opgraph
     from zrt.training.search.estimator import estimate
     from zrt.training.search.training_search_util import format_results
 
@@ -313,7 +317,8 @@ def test_search_results_table_has_recompute_columns():
         tp=1, cp=1, pp=2, ep=1, dp=4, micro_batch=1, global_batch=8,
         recompute=RecomputePolicy(per_layer={"dense": {"full"}}),
     )
-    report = estimate(model, system, strategy)
+    graph = build_opgraph(model, strategy)
+    report = estimate(model, system, strategy, graph=graph)
     df = format_results([report], [{"model": "m"}])
 
     for col in ("compute_time_ms", "recompute_critical_ms", "recompute_raw_mag_ms",

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import openpyxl
 import pytest
 
 from zrt.hardware.spec import InterconnectSpec, LinkSpec
 from zrt.training.compose.stage import _cost_phase_time
 from zrt.training.io.excel_exporter import export_estimate_excel
-from zrt.training.ir.training_graph import Graph, Op, Tensor
 from zrt.training.models.flops import op_cost
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import LayerKind, ModelSpec
@@ -52,10 +53,16 @@ def _model() -> ModelSpec:
     )
 
 
-def _routed_op() -> Op:
-    x = Tensor("x", (1024, 1024), (1024, 1024), Dtype.FP8_E4M3, True)
-    y = Tensor("y", (1024, 1024), (1024, 1024), Dtype.FP8_E4M3, True)
-    return Op(
+def _routed_op():
+    x = SimpleNamespace(
+        name="x", shape_logical=(1024, 1024), shape_local=(1024, 1024),
+        dtype=Dtype.FP8_E4M3, is_activation=True, is_param=False,
+    )
+    y = SimpleNamespace(
+        name="y", shape_logical=(1024, 1024), shape_local=(1024, 1024),
+        dtype=Dtype.FP8_E4M3, is_activation=True, is_param=False,
+    )
+    return SimpleNamespace(
         name="L0.routed_expert_ffn",
         kind="matmul",
         inputs=[x],
@@ -93,7 +100,7 @@ def test_excel_ops_latency_uses_routed_expert_compute_dtype(tmp_path):
     system = _system()
     strategy = Strategy()
     op = _routed_op()
-    graph = Graph(ops=[op], layer_index={0: (0, 1)})
+    graph = SimpleNamespace(ops=[op])
     cost = op_cost(op, model, system)
 
     path = tmp_path / "report.xlsx"
@@ -129,7 +136,7 @@ def test_excel_operator_time_share_uses_routed_expert_compute_dtype(tmp_path):
     system = _system()
     strategy = Strategy()
     op = _routed_op()
-    graph = Graph(ops=[op], layer_index={0: (0, 1)})
+    graph = SimpleNamespace(ops=[op])
     cost = op_cost(op, model, system)
 
     path = tmp_path / "report.xlsx"

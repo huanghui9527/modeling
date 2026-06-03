@@ -264,6 +264,10 @@ class TrainingConfig:
     # Recompute policy
     recompute_policy: str = "none"  # "none", "full", "selective"
 
+    # Graph-capture MegaMoE controls
+    mega_moe: bool = False
+    mega_moe_waves: int = 0
+
     # Pipeline schedule
     pp_schedule: str = "1f1b"  # "1f1b", "interleaved", "dualpipe", "dualpipev", "zb"
     vpp_chunks: int = 1

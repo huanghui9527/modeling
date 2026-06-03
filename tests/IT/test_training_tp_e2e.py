@@ -1,4 +1,4 @@
-"""End-to-end test for training modeling pipeline (Path 2).
+"""End-to-end test for training modeling pipeline (路径 A: 抓图建模).
 
 Tests DeepSeek V3, V3.2, and V4 models to verify:
 1. TP shape splitting correctness across different TP degrees (1, 2, 4)

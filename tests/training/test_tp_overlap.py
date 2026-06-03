@@ -6,10 +6,12 @@ MC2 -> assume comm fully covered by GEMM (bounded by gemm time, not flat 0).
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from zrt.training.compose.stage import _tp_gemm_time, _wave_overlap_saved
-from zrt.training.ir.training_graph import Op, Tensor
+from zrt.training.models.comm import comm_spec_from_node
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import LayerKind, ModelSpec
 from zrt.training.spec.strategy import PPSched, Strategy, TPOverlap
@@ -53,26 +55,32 @@ def _model(num_layers: int = 4):
     )
 
 
-def _t(name: str, shape: tuple[int, ...], dtype: Dtype = Dtype.BF16) -> Tensor:
-    """Build a Tensor with matching logical/local shapes."""
-    return Tensor(name=name, shape_logical=shape, shape_local=shape,
-                  dtype=dtype, is_activation=True, is_param=False)
+def _t(name: str, shape: tuple[int, ...], dtype: Dtype = Dtype.BF16):
+    """Build a tensor-like SimpleNamespace with matching logical/local shapes."""
+    bpe = dtype.bytes
+    return SimpleNamespace(
+        name=name, shape_logical=shape, shape_local=shape,
+        dtype=dtype, is_activation=True, is_param=False,
+        num_elements=lambda: 1,
+        nbytes=lambda: int(eval("*".join(map(str, shape))) * bpe),
+    )
 
 
 def _matmul_op(name: str, m: int = 4096, n: int = 4096, k: int = 4096,
-               layer_id: int = 0) -> Op:
-    """Build a matmul Op consistent with the IR builders.
+               layer_id: int = 0):
+    """Build a matmul op-like SimpleNamespace consistent with the IR builders.
 
     Op cost is derived by `op_cost()` from meta {m, n, k} and tensor shapes,
     not from precomputed fwd_flops/bytes. We supply both so _matmul_cost
     finds an unambiguous shape.
     """
-    return Op(
+    return SimpleNamespace(
         name=name, kind="matmul",
         inputs=[_t("a", (m, k))],
         outputs=[_t("c", (m, n))],
         meta={"m": m, "n": n, "k": k},
         layer_id=layer_id, layer_kind=LayerKind.DENSE,
+        component="",
     )
 
 
@@ -94,7 +102,7 @@ class TestTPGemmTime:
 
     def test_non_matmul_ignored(self):
         """RMSNorm / Softmax / etc. are not matmul → don't count."""
-        op = Op(
+        op = SimpleNamespace(
             name="layers.0.attn.softmax", kind="softmax",
             inputs=[_t("x", (4096, 32, 4096))],
             outputs=[_t("y", (4096, 32, 4096))],
@@ -119,7 +127,7 @@ class TestStageTimeTPOverlap:
     def _stage_with_tp(self, tp_overlap: TPOverlap):
         """Build a 1-layer stage with TP=4. Returns StageTime."""
         from zrt.training.compose.stage import stage_time
-        from zrt.training.ir.builders import build_graph
+        from zrt.training.ir.opgraph_builder import build_opgraph
         model = _model()
         system = _system()
         strategy = Strategy(
@@ -127,8 +135,10 @@ class TestStageTimeTPOverlap:
             micro_batch=1, global_batch=1,
             tp_overlap=tp_overlap,
         )
-        graph = build_graph(model, strategy)
-        st = stage_time(graph.ops, graph.collectives, model, system, strategy)
+        graph = build_opgraph(model, strategy)
+        ops = [n for n in graph.nodes.values() if not n.is_comm]
+        colls = [comm_spec_from_node(n) for n in graph.nodes.values() if n.is_comm]
+        st = stage_time(ops, colls, model, system, strategy)
         return st
 
     def test_coc_hides_less_than_full_90pct_when_gemm_bound(self):
@@ -169,6 +179,7 @@ class TestSchedulesTPHidden:
     """
 
     def _run_estimate(self, tp_overlap: TPOverlap):
+        from zrt.training.ir.opgraph_builder import build_opgraph
         from zrt.training.search.estimator import estimate
         model = _model()
         system = _system()
@@ -177,7 +188,8 @@ class TestSchedulesTPHidden:
             micro_batch=1, global_batch=2,
             tp_overlap=tp_overlap,
         )
-        return estimate(model, system, strategy)
+        graph = build_opgraph(model, strategy)
+        return estimate(model, system, strategy, graph=graph)
 
     def test_coc_tp_hidden_nonzero(self):
         """CoC produces nonzero tp_hidden in the final step report."""
@@ -204,8 +216,9 @@ class TestSchedulesTPHidden:
 
     def _run_estimate_pp(self, tp_overlap: TPOverlap, pp: int, dp: int):
         """Variant that lets caller set pp/dp (for conservation testing)."""
+        from zrt.training.ir.opgraph_builder import build_opgraph
         from zrt.training.search.estimator import estimate
-        model = _model(num_layers=8)  # enough layers for pp=2/4
+        model = _model(num_layers=8)
         system = _system_with(nodes=1, gpus_per_node=4 * pp * dp)
         strategy = Strategy(
             tp=4, pp=pp, dp=dp, ep=1, cp=1,
@@ -213,7 +226,8 @@ class TestSchedulesTPHidden:
             tp_overlap=tp_overlap,
             pp_schedule=PPSched.ONE_F_ONE_B,
         )
-        return estimate(model, system, strategy)
+        graph = build_opgraph(model, strategy)
+        return estimate(model, system, strategy, graph=graph)
 
     @pytest.mark.parametrize("overlap", [TPOverlap.COC, TPOverlap.MC2])
     def test_conservation_invariant_holds_with_pp(self, overlap):
@@ -269,16 +283,19 @@ class TestTPCollectivePhaseSplit:
         """The IR generates only phase='both' for TP collectives. If this
         invariant changes, stage.py's 50/50 split logic must be revisited
         together with this test."""
-        from zrt.training.ir.builders import build_graph
+        from zrt.training.ir.opgraph_builder import build_opgraph
         model = _model()
         strategy = Strategy(tp=4, pp=1, dp=1, ep=1, cp=1,
                             micro_batch=1, global_batch=1)
-        graph = build_graph(model, strategy)
-        tp_collectives = [c for c in graph.collectives if c.group == "TP"]
-        assert len(tp_collectives) > 0, "Expected TP collectives when tp>1"
-        for c in tp_collectives:
-            assert c.phase == "both", (
-                f"TP collective {c.name} has phase={c.phase!r}; if intentional, "
+        graph = build_opgraph(model, strategy)
+        tp_nodes = [n for n in graph.nodes.values()
+                    if n.is_comm and n.attrs.get("comm_group") == "TP"]
+        assert len(tp_nodes) > 0, "Expected TP collectives when tp>1"
+        for n in tp_nodes:
+            phase = n.attrs.get("comm_phase")
+            name = n.name or n.id
+            assert phase == "both", (
+                f"TP collective {name} has phase={phase!r}; if intentional, "
                 f"update compose/stage.py (the 50/50 split) accordingly"
             )
 
@@ -293,19 +310,21 @@ class TestTPCollectivePhaseSplit:
         allow for any matmul-tiered second-order effects.
         """
         from zrt.training.compose.stage import stage_time
-        from zrt.training.ir.builders import build_graph
+        from zrt.training.ir.opgraph_builder import build_opgraph
         from zrt.training.models.comm import collective_time, tier_for_group
         model = _model()
         system = _system()
         strategy = Strategy(tp=4, pp=1, dp=1, ep=1, cp=1,
                             micro_batch=1, global_batch=1,
                             tp_overlap=TPOverlap.NONE)
-        graph = build_graph(model, strategy)
-        st = stage_time(graph.ops, graph.collectives, model, system, strategy)
+        graph = build_opgraph(model, strategy)
+        ops = [n for n in graph.nodes.values() if not n.is_comm]
+        colls = [comm_spec_from_node(n) for n in graph.nodes.values() if n.is_comm]
+        st = stage_time(ops, colls, model, system, strategy)
         raw_tp = sum(
             collective_time(c, strategy.tp,
                             tier_for_group(c.group, strategy.tp, system))
-            for c in graph.collectives if c.group == "TP"
+            for c in colls if c.group == "TP"
         )
         assert raw_tp > 0, "Need nonzero TP comm to test the split"
         max_side = max(st.comm_fwd, st.comm_bwd)

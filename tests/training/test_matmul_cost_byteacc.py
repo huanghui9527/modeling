@@ -12,21 +12,46 @@ from __future__ import annotations
 
 import pytest
 
-from zrt.training.ir.training_graph import Op, Tensor
+from types import SimpleNamespace
+
 from zrt.training.models.flops import _matmul_cost
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import LayerKind, ModelSpec
 
 
+class _FakeTensor:
+    __slots__ = ("name", "shape_logical", "shape_local", "dtype",
+                 "is_activation", "is_param")
+
+    def __init__(self, name: str, shape_logical: tuple[int, ...],
+                 shape_local: tuple[int, ...], dtype: Dtype,
+                 is_activation: bool = True, is_param: bool = False):
+        self.name = name
+        self.shape_logical = shape_logical
+        self.shape_local = shape_local
+        self.dtype = dtype
+        self.is_activation = is_activation
+        self.is_param = is_param
+
+    def num_elements(self) -> int:
+        r = 1
+        for d in self.shape_local:
+            r *= d
+        return r
+
+    def nbytes(self) -> int:
+        return self.num_elements() * self.dtype.bytes
+
+
 def _matmul_op(m: int, n: int, k: int, in_dtype: Dtype = Dtype.BF16,
                out_dtype: Dtype = Dtype.BF16, component: str | None = None,
                name: str = "L0.test_matmul"):
-    return Op(
+    return SimpleNamespace(
         name=name, kind="matmul",
-        inputs=[Tensor(name="x", shape_logical=(m, k), shape_local=(m, k),
-                       dtype=in_dtype, is_activation=True)],
-        outputs=[Tensor(name="y", shape_logical=(m, n), shape_local=(m, n),
-                        dtype=out_dtype, is_activation=True)],
+        inputs=[_FakeTensor(name="x", shape_logical=(m, k), shape_local=(m, k),
+                            dtype=in_dtype)],
+        outputs=[_FakeTensor(name="y", shape_logical=(m, n), shape_local=(m, n),
+                             dtype=out_dtype)],
         meta={"m": m, "n": n, "k": k},
         layer_id=0, layer_kind=LayerKind.MOE, component=component,
     )

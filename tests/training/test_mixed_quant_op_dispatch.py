@@ -1,8 +1,9 @@
 """Tests for Op.component tagging + compute-dtype dispatch."""
 import pytest
+from types import SimpleNamespace
 
 from zrt.training.compose.stage import _resolve_compute_dtype
-from zrt.training.ir.training_graph import Op
+from zrt.ir.node import OpNode
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import LayerKind, ModelSpec
 
@@ -15,7 +16,7 @@ def _model(**dtype_kwargs):
 
 
 def _op(name, kind="matmul", component=None):
-    return Op(name=name, kind=kind, component=component)
+    return SimpleNamespace(name=name, kind=kind, component=component)
 
 
 def test_attention_op_uses_attn_compute_dtype():
@@ -54,11 +55,11 @@ def test_unset_component_falls_back_to_act_dtype():
     assert _resolve_compute_dtype(op, m) is Dtype.FP16
 
 
-def test_op_dataclass_has_component_field_default_none():
-    op = Op(name="x", kind="matmul")
-    assert op.component is None
+def test_opnode_has_component_field_default_empty():
+    node = OpNode(id="op_0", op_type="aten.mm.default")
+    assert node.component == ""
 
 
-def test_op_dataclass_accepts_component_kwarg():
-    op = Op(name="x", kind="matmul", component="attention")
-    assert op.component == "attention"
+def test_opnode_accepts_component_kwarg():
+    node = OpNode(id="op_0", op_type="aten.mm.default", component="attention")
+    assert node.component == "attention"

@@ -237,6 +237,13 @@ class TestMakeStrategyFromConfig:
 
         assert strategy.cp_kind == CPKind.ULYSSES
 
+    def test_mega_moe_fields(self):
+        config = {"mega_moe": True, "mega_moe_waves": 4}
+        strategy = _make_strategy_from_config(config)
+
+        assert strategy.mega_moe is True
+        assert strategy.mega_moe_waves == 4
+
     def test_hybrid_cp_factors(self):
         strategy = _make_strategy_from_config({
             "cp": 8,
@@ -662,7 +669,7 @@ class TestTrainingConfigManager:
         )
 
     def test_worker_skips_memory_infeasible_config_before_graph_build(self, monkeypatch):
-        import zrt.training.ir.builders as builders
+        import zrt.training.ir.opgraph_builder as opgraph_builder
         import zrt.training.search.training_search_util as search_util
 
         class FakeStrategy:
@@ -690,10 +697,10 @@ class TestTrainingConfigManager:
             lambda graph, model, system, strategy: MemBreakdown(weights=9e9),
         )
 
-        def fail_build_graph(*args, **kwargs):
-            raise AssertionError("build_graph should not run for memory-skipped configs")
+        def fail_build_opgraph(*args, **kwargs):
+            raise AssertionError("build_explicit_graph should not run for memory-skipped configs")
 
-        monkeypatch.setattr(builders, "build_graph", fail_build_graph)
+        monkeypatch.setattr(opgraph_builder, "build_explicit_graph", fail_build_opgraph)
 
         result = run_training_task_wrapper({"model": "fake", "hw": "fake", "world_size": 1})
 
@@ -701,7 +708,7 @@ class TestTrainingConfigManager:
         assert result["type"] == "memory"
 
     def test_worker_reuses_graph_cache_for_equivalent_graph_configs(self, monkeypatch):
-        import zrt.training.ir.builders as builders
+        import zrt.training.ir.opgraph_builder as opgraph_builder
         import zrt.training.search.training_search_util as search_util
 
         class FakeStrategy:
@@ -741,11 +748,11 @@ class TestTrainingConfigManager:
             lambda graph, model, system, strategy: MemBreakdown(weights=1e9),
         )
 
-        def fake_build_graph(model, strategy):
+        def fake_build_opgraph(model, strategy):
             build_calls.append((strategy.dp, strategy.global_batch))
-            return SimpleNamespace(ops=[], collectives=[])
+            return SimpleNamespace(nodes={}, edges=[], metadata={})
 
-        monkeypatch.setattr(builders, "build_graph", fake_build_graph)
+        monkeypatch.setattr(opgraph_builder, "build_explicit_graph", fake_build_opgraph)
         monkeypatch.setattr(
             search_util,
             "estimate",
@@ -1133,7 +1140,7 @@ class TestSearchOutputs:
 
     def test_export_best_configs_excel_exports_lowest_step_time_per_group(self, monkeypatch):
         import zrt.training.io.excel_exporter as excel_exporter
-        import zrt.training.ir.builders as builders
+        import zrt.training.ir.opgraph_builder as opgraph_builder
         import zrt.training.models.flops as flops
         import zrt.training.search.training_search_util as search_util
 
@@ -1151,12 +1158,15 @@ class TestSearchOutputs:
 
         monkeypatch.setattr(search_util, "_load_model_spec", recording_load_model_spec)
 
+        fake_node = SimpleNamespace(id="fake_op", is_comm=False)
         monkeypatch.setattr(
-            builders,
-            "build_graph",
-            lambda model, strategy: SimpleNamespace(ops=[SimpleNamespace(name="fake_op")]),
+            opgraph_builder,
+            "build_explicit_graph",
+            lambda model, strategy: SimpleNamespace(
+                nodes={"fake_op": fake_node}, edges=[], metadata={},
+            ),
         )
-        monkeypatch.setattr(flops, "op_cost", lambda op, model, system: 1.0)
+        monkeypatch.setattr(flops, "op_cost_from_node", lambda node, model, system: 1.0)
 
         def fake_export_estimate_excel(**kwargs):
             exported.append(kwargs)

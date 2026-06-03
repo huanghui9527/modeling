@@ -471,7 +471,7 @@ def _do_estimate(req: EstimateRequest, job_id: str) -> dict:
 
     config_path, tmp = _resolve_yaml(req.config_path, req.config_content)
     try:
-        model, system, strategy = load_specs(config_path)
+        model, system, strategy, _capture = load_specs(config_path)
 
         # Build graph once so we can reuse it for op_costs and estimate
         graph = build_graph(model, strategy)
@@ -635,7 +635,7 @@ def _do_search(req: SearchRequest, job_id: str) -> dict:
 
     config_path, tmp = _resolve_yaml(req.config_path, req.config_content)
     try:
-        model, system, strategy = load_specs(config_path)
+        model, system, strategy, _capture = load_specs(config_path)
         space = _build_search_space(req, strategy)
         # Pair each surviving (strategy, report) so we can render any Pareto
         # entry later. The stock grid_search() drops the originating strategy.

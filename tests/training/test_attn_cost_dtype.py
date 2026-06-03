@@ -2,31 +2,34 @@
 from __future__ import annotations
 
 import pytest
+from types import SimpleNamespace
 
-from zrt.training.ir.training_graph import Op, Tensor
 from zrt.training.models.flops import op_cost, _attn_cost
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import LayerKind, ModelSpec
 
 
+def _make_tensor(name, shape_logical, shape_local, dtype, is_activation=True):
+    import math
+    ne = math.prod(shape_local)
+    return SimpleNamespace(
+        name=name, shape_logical=shape_logical, shape_local=shape_local,
+        dtype=dtype, is_activation=is_activation,
+        num_elements=lambda: ne,
+        nbytes=lambda: ne * dtype.bytes,
+    )
+
+
 def _make_attn_op(seq: int = 256, heads: int = 4, head_dim: int = 32,
                    in_dtype: Dtype = Dtype.BF16, component: str = "attention"):
-    return Op(
+    return SimpleNamespace(
         name="L0.attn_core", kind="attn_core",
         inputs=[
-            Tensor(name="q", shape_logical=(seq, heads, head_dim),
-                   shape_local=(seq, heads, head_dim), dtype=in_dtype,
-                   is_activation=True),
-            Tensor(name="k", shape_logical=(seq, heads, head_dim),
-                   shape_local=(seq, heads, head_dim), dtype=in_dtype,
-                   is_activation=True),
-            Tensor(name="v", shape_logical=(seq, heads, head_dim),
-                   shape_local=(seq, heads, head_dim), dtype=in_dtype,
-                   is_activation=True),
+            _make_tensor("q", (seq, heads, head_dim), (seq, heads, head_dim), in_dtype),
+            _make_tensor("k", (seq, heads, head_dim), (seq, heads, head_dim), in_dtype),
+            _make_tensor("v", (seq, heads, head_dim), (seq, heads, head_dim), in_dtype),
         ],
-        outputs=[Tensor(name="o", shape_logical=(seq, heads, head_dim),
-                        shape_local=(seq, heads, head_dim), dtype=in_dtype,
-                        is_activation=True)],
+        outputs=[_make_tensor("o", (seq, heads, head_dim), (seq, heads, head_dim), in_dtype)],
         meta={"b": 1, "s": seq, "heads": heads, "head_dim": head_dim,
               "causal": True},
         layer_id=0, layer_kind=LayerKind.MOE, component=component,

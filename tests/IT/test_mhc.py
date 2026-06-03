@@ -7,16 +7,16 @@ defined in the DeepSeek-V4 inference model
 """
 
 import pytest
+from types import SimpleNamespace
 from zrt.training.ir.builders import (
     _mhc_pre_op,
     _mhc_post_op,
     _mhc_head_op,
     _hc_expand_op,
     dense_block,
-    build_graph,
 )
-from zrt.training.ir.training_graph import Op
-from zrt.training.models.flops import op_cost, _mhc_pre_cost, _mhc_post_cost, _mhc_head_cost
+from zrt.training.ir.opgraph_builder import build_opgraph
+from zrt.training.models.flops import op_cost, _mhc_pre_cost, _mhc_post_cost, _mhc_head_cost, _iter_ops
 from zrt.training.models.memory import memory_breakdown
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import ModelSpec, LayerKind
@@ -208,57 +208,61 @@ class TestDenseBlockWithHC:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 5. IR Builder: build_graph end-to-end with HC
+# 5. IR Builder: build_opgraph end-to-end with HC
 # ══════════════════════════════════════════════════════════════════════
 
 class TestBuildGraphWithHC:
     def test_graph_has_hc_expand_and_head(self):
         model = _make_hc_model(n_layers=2)
         strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1)
-        graph = build_graph(model, strategy)
-        kinds = [op.kind for op in graph.ops]
+        graph = build_opgraph(model, strategy)
+        kinds = [op.kind for op in _iter_ops(graph)]
         assert "hc_expand" in kinds, "HC graph should have hc_expand"
         assert "mhc_head" in kinds, "HC graph should have mhc_head"
 
     def test_graph_no_hc_no_expand_or_head(self):
         model = _make_no_hc_model(n_layers=2)
         strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1)
-        graph = build_graph(model, strategy)
-        kinds = [op.kind for op in graph.ops]
+        graph = build_opgraph(model, strategy)
+        kinds = [op.kind for op in _iter_ops(graph)]
         assert "hc_expand" not in kinds
         assert "mhc_head" not in kinds
 
     def test_hc_expand_before_blocks(self):
         model = _make_hc_model(n_layers=2)
         strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1)
-        graph = build_graph(model, strategy)
-        expand_idx = next(i for i, op in enumerate(graph.ops) if op.kind == "hc_expand")
-        first_block_idx = next(i for i, op in enumerate(graph.ops) if op.layer_id == 0)
+        graph = build_opgraph(model, strategy)
+        ops = _iter_ops(graph)
+        expand_idx = next(i for i, op in enumerate(ops) if op.kind == "hc_expand")
+        first_block_idx = next(i for i, op in enumerate(ops) if op.layer_id == 0)
         assert expand_idx < first_block_idx
 
     def test_mhc_head_after_blocks(self):
         model = _make_hc_model(n_layers=2)
         strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1)
-        graph = build_graph(model, strategy)
-        head_idx = next(i for i, op in enumerate(graph.ops) if op.kind == "mhc_head")
-        last_block_idx = max(i for i, op in enumerate(graph.ops) if op.layer_id >= 0)
+        graph = build_opgraph(model, strategy)
+        ops = _iter_ops(graph)
+        head_idx = next(i for i, op in enumerate(ops) if op.kind == "mhc_head")
+        last_block_idx = max(i for i, op in enumerate(ops) if op.layer_id >= 0)
         assert head_idx > last_block_idx or head_idx == last_block_idx + 1
 
     def test_mhc_pre_count_per_layer(self):
         model = _make_hc_model(n_layers=3)
         strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1)
-        graph = build_graph(model, strategy)
+        graph = build_opgraph(model, strategy)
+        all_ops = _iter_ops(graph)
         for lid in range(3):
-            layer_ops = graph.ops_for_layer(lid)
+            layer_ops = [op for op in all_ops if op.layer_id == lid]
             pre_ops = [op for op in layer_ops if op.kind == "mhc_pre"]
             assert len(pre_ops) == 2, f"Layer {lid} should have 2 mhc_pre ops (attn+ffn)"
 
     def test_mhc_post_count_per_layer(self):
         model = _make_hc_model(n_layers=3)
         strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1)
-        graph = build_graph(model, strategy)
+        graph = build_opgraph(model, strategy)
+        all_ops = _iter_ops(graph)
         for lid in range(3):
-            layer_ops = graph.ops_for_layer(lid)
+            layer_ops = [op for op in all_ops if op.layer_id == lid]
             post_ops = [op for op in layer_ops if op.kind == "mhc_post"]
             assert len(post_ops) == 2, f"Layer {lid} should have 2 mhc_post ops (attn+ffn)"
 
@@ -271,7 +275,7 @@ class TestMhcPreCost:
     def test_linear_flops(self):
         b, s, h, hc = 1, 4096, 7168, 4
         mix = (2 + hc) * hc
-        op = Op(name="test", kind="mhc_pre", inputs=[], outputs=[],
+        op = SimpleNamespace(name="test", kind="mhc_pre", inputs=[], outputs=[],
                 meta={"b": b, "s": s, "h": h, "hc": hc,
                        "mix_hc": mix, "sinkhorn_iters": 20})
         cost = _mhc_pre_cost(op)
@@ -282,7 +286,7 @@ class TestMhcPreCost:
         b, s, h, hc = 1, 4096, 7168, 4
         it = 20
         mix = (2 + hc) * hc
-        op = Op(name="test", kind="mhc_pre", inputs=[], outputs=[],
+        op = SimpleNamespace(name="test", kind="mhc_pre", inputs=[], outputs=[],
                 meta={"b": b, "s": s, "h": h, "hc": hc,
                        "mix_hc": mix, "sinkhorn_iters": it})
         cost = _mhc_pre_cost(op)
@@ -297,7 +301,7 @@ class TestMhcPreCost:
         it = 20
         mix = (2 + hc) * hc
         bpe = 2
-        op = Op(name="test", kind="mhc_pre", inputs=[], outputs=[],
+        op = SimpleNamespace(name="test", kind="mhc_pre", inputs=[], outputs=[],
                 meta={"b": b, "s": s, "h": h, "hc": hc,
                        "mix_hc": mix, "sinkhorn_iters": it})
         cost = _mhc_pre_cost(op)
@@ -307,7 +311,7 @@ class TestMhcPreCost:
     def test_weighted_sum_flops(self):
         b, s, h, hc = 1, 4096, 7168, 4
         mix = (2 + hc) * hc
-        op = Op(name="test", kind="mhc_pre", inputs=[], outputs=[],
+        op = SimpleNamespace(name="test", kind="mhc_pre", inputs=[], outputs=[],
                 meta={"b": b, "s": s, "h": h, "hc": hc,
                        "mix_hc": mix, "sinkhorn_iters": 20})
         cost = _mhc_pre_cost(op)
@@ -320,7 +324,7 @@ class TestMhcPreCost:
     def test_dw_only_linear(self):
         b, s, h, hc = 1, 4096, 7168, 4
         mix = (2 + hc) * hc
-        op = Op(name="test", kind="mhc_pre", inputs=[], outputs=[],
+        op = SimpleNamespace(name="test", kind="mhc_pre", inputs=[], outputs=[],
                 meta={"b": b, "s": s, "h": h, "hc": hc,
                        "mix_hc": mix, "sinkhorn_iters": 20})
         cost = _mhc_pre_cost(op)
@@ -328,7 +332,7 @@ class TestMhcPreCost:
         assert cost.dw_cube_flops == expected_lin
 
     def test_backward_greater_than_forward(self):
-        op = Op(name="test", kind="mhc_pre", inputs=[], outputs=[],
+        op = SimpleNamespace(name="test", kind="mhc_pre", inputs=[], outputs=[],
                 meta={"b": 1, "s": 4096, "h": 7168, "hc": 4,
                        "mix_hc": 24, "sinkhorn_iters": 20})
         cost = _mhc_pre_cost(op)
@@ -342,20 +346,20 @@ class TestMhcPreCost:
 class TestMhcPostCost:
     def test_fwd_flops_formula(self):
         b, s, h, hc = 1, 4096, 7168, 4
-        op = Op(name="test", kind="mhc_post", inputs=[], outputs=[],
+        op = SimpleNamespace(name="test", kind="mhc_post", inputs=[], outputs=[],
                 meta={"b": b, "s": s, "h": h, "hc": hc})
         cost = _mhc_post_cost(op)
         expected = float(b * s * hc * h) * 2.0 + float(b * s * hc * hc * h) * 2.0
         assert cost.fwd_cube_flops == pytest.approx(expected)
 
     def test_no_dw(self):
-        op = Op(name="test", kind="mhc_post", inputs=[], outputs=[],
+        op = SimpleNamespace(name="test", kind="mhc_post", inputs=[], outputs=[],
                 meta={"b": 1, "s": 4096, "h": 7168, "hc": 4})
         cost = _mhc_post_cost(op)
         assert cost.dw_cube_flops == 0.0
 
     def test_fwd_bytes_positive(self):
-        op = Op(name="test", kind="mhc_post", inputs=[], outputs=[],
+        op = SimpleNamespace(name="test", kind="mhc_post", inputs=[], outputs=[],
                 meta={"b": 1, "s": 4096, "h": 7168, "hc": 4})
         cost = _mhc_post_cost(op)
         assert cost.fwd_bytes > 0
@@ -374,7 +378,7 @@ class TestMhcPostCost:
 class TestMhcHeadCost:
     def test_head_mix_equals_hc(self):
         hc = 4
-        op = Op(name="test", kind="mhc_head", inputs=[], outputs=[],
+        op = SimpleNamespace(name="test", kind="mhc_head", inputs=[], outputs=[],
                 meta={"b": 1, "s": 4096, "h": 7168, "hc": hc, "mix_hc": hc})
         cost = _mhc_head_cost(op)
         expected_lin = 2.0 * 1 * 4096 * (hc * 7168) * hc
@@ -382,10 +386,10 @@ class TestMhcHeadCost:
         assert abs(cost.fwd_cube_flops - expected_lin - expected_sum) < 1.0
 
     def test_head_no_sinkhorn(self):
-        op = Op(name="test", kind="mhc_head", inputs=[], outputs=[],
+        op = SimpleNamespace(name="test", kind="mhc_head", inputs=[], outputs=[],
                 meta={"b": 1, "s": 4096, "h": 7168, "hc": 4, "mix_hc": 4})
         cost = _mhc_head_cost(op)
-        pre_cost = _mhc_pre_cost(Op(name="test", kind="mhc_pre", inputs=[], outputs=[],
+        pre_cost = _mhc_pre_cost(SimpleNamespace(name="test", kind="mhc_pre", inputs=[], outputs=[],
                                      meta={"b": 1, "s": 4096, "h": 7168, "hc": 4,
                                            "mix_hc": 24, "sinkhorn_iters": 20}))
         assert cost.fwd_cube_flops < pre_cost.fwd_cube_flops, \
@@ -399,7 +403,7 @@ class TestMhcHeadCost:
 class TestOpCostDispatch:
     def test_mhc_pre_dispatch(self):
         model = _make_hc_model()
-        op = Op(name="test", kind="mhc_pre", inputs=[], outputs=[],
+        op = SimpleNamespace(name="test", kind="mhc_pre", inputs=[], outputs=[],
                 meta={"b": 1, "s": 4096, "h": 7168, "hc": 4,
                        "mix_hc": 24, "sinkhorn_iters": 20})
         cost = op_cost(op, model)
@@ -407,14 +411,14 @@ class TestOpCostDispatch:
 
     def test_mhc_post_dispatch(self):
         model = _make_hc_model()
-        op = Op(name="test", kind="mhc_post", inputs=[], outputs=[],
+        op = SimpleNamespace(name="test", kind="mhc_post", inputs=[], outputs=[],
                 meta={"b": 1, "s": 4096, "h": 7168, "hc": 4})
         cost = op_cost(op, model)
         assert cost.fwd_cube_flops > 0
 
     def test_mhc_head_dispatch(self):
         model = _make_hc_model()
-        op = Op(name="test", kind="mhc_head", inputs=[], outputs=[],
+        op = SimpleNamespace(name="test", kind="mhc_head", inputs=[], outputs=[],
                 meta={"b": 1, "s": 4096, "h": 7168, "hc": 4, "mix_hc": 4})
         cost = op_cost(op, model)
         assert cost.fwd_cube_flops > 0
@@ -427,19 +431,19 @@ class TestOpCostDispatch:
 class TestMhcRecomputeCategory:
     def test_mhc_pre_category(self):
         from zrt.training.models.flops import _op_recompute_categories
-        op = Op(name="test", kind="mhc_pre", inputs=[], outputs=[], meta={})
+        op = SimpleNamespace(name="test", kind="mhc_pre", inputs=[], outputs=[], meta={})
         cats = _op_recompute_categories(op)
         assert "hc" in cats
 
     def test_mhc_post_category(self):
         from zrt.training.models.flops import _op_recompute_categories
-        op = Op(name="test", kind="mhc_post", inputs=[], outputs=[], meta={})
+        op = SimpleNamespace(name="test", kind="mhc_post", inputs=[], outputs=[], meta={})
         cats = _op_recompute_categories(op)
         assert "hc" in cats
 
     def test_mhc_head_category(self):
         from zrt.training.models.flops import _op_recompute_categories
-        op = Op(name="test", kind="mhc_head", inputs=[], outputs=[], meta={})
+        op = SimpleNamespace(name="test", kind="mhc_head", inputs=[], outputs=[], meta={})
         cats = _op_recompute_categories(op)
         assert "hc" in cats
 
@@ -451,8 +455,8 @@ class TestMhcRecomputeCategory:
             tp=1, pp=1, dp=1, micro_batch=1,
             recompute=RecomputePolicy(per_layer={"dense": {"hc"}}),
         )
-        graph_no = build_graph(model, strat_no_rc)
-        graph_rc = build_graph(model, strat_hc_rc)
+        graph_no = build_opgraph(model, strat_no_rc)
+        graph_rc = build_opgraph(model, strat_hc_rc)
         mem_no = memory_breakdown(graph_no, model, system, strat_no_rc)
         mem_rc = memory_breakdown(graph_rc, model, system, strat_hc_rc)
         assert mem_rc.activations < mem_no.activations, \
@@ -467,8 +471,8 @@ class TestMhcRecomputeCategory:
             tp=1, pp=1, dp=1, micro_batch=1,
             recompute=RecomputePolicy(per_layer={"dense": {"hc"}}),
         )
-        graph_no = build_graph(model, strat_no_rc)
-        graph_rc = build_graph(model, strat_hc_rc)
+        graph_no = build_opgraph(model, strat_no_rc)
+        graph_rc = build_opgraph(model, strat_hc_rc)
         overhead_no = recompute_overhead_flops(graph_no, model, strat_no_rc, system)
         overhead_rc = recompute_overhead_flops(graph_rc, model, strat_hc_rc, system)
         assert overhead_rc > overhead_no, \
@@ -527,8 +531,8 @@ class TestHcMemory:
         model_no = _make_no_hc_model()
         system = _make_system()
         strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1)
-        graph_hc = build_graph(model_hc, strategy)
-        graph_no = build_graph(model_no, strategy)
+        graph_hc = build_opgraph(model_hc, strategy)
+        graph_no = build_opgraph(model_no, strategy)
         mem_hc = memory_breakdown(graph_hc, model_hc, system, strategy)
         mem_no = memory_breakdown(graph_no, model_no, system, strategy)
         assert mem_hc.activations > mem_no.activations, \
@@ -555,8 +559,8 @@ class TestHcTotalFlops:
         model_no = _make_no_hc_model()
         system = _make_system()
         strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1)
-        graph_hc = build_graph(model_hc, strategy)
-        graph_no = build_graph(model_no, strategy)
+        graph_hc = build_opgraph(model_hc, strategy)
+        graph_no = build_opgraph(model_no, strategy)
         total_hc = total_training_flops(graph_hc, model_hc, strategy, system)
         total_no = total_training_flops(graph_no, model_no, strategy, system)
         assert total_hc > total_no, "HC model should have more total training FLOPs"
@@ -567,8 +571,8 @@ class TestHcTotalFlops:
         model_no = _make_no_hc_model()
         system = _make_system()
         strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1)
-        graph_hc = build_graph(model_hc, strategy)
-        graph_no = build_graph(model_no, strategy)
+        graph_hc = build_opgraph(model_hc, strategy)
+        graph_no = build_opgraph(model_no, strategy)
         total_hc = total_training_flops(graph_hc, model_hc, strategy, system)
         total_no = total_training_flops(graph_no, model_no, strategy, system)
         overhead_frac = (total_hc - total_no) / total_no
@@ -584,10 +588,10 @@ class TestSinkhornScaling:
     def test_sinkhorn_scales_with_iters(self):
         b, s, h, hc = 1, 4096, 7168, 4
         mix = (2 + hc) * hc
-        op_10 = Op(name="test", kind="mhc_pre", inputs=[], outputs=[],
+        op_10 = SimpleNamespace(name="test", kind="mhc_pre", inputs=[], outputs=[],
                     meta={"b": b, "s": s, "h": h, "hc": hc,
                           "mix_hc": mix, "sinkhorn_iters": 10})
-        op_20 = Op(name="test", kind="mhc_pre", inputs=[], outputs=[],
+        op_20 = SimpleNamespace(name="test", kind="mhc_pre", inputs=[], outputs=[],
                     meta={"b": b, "s": s, "h": h, "hc": hc,
                           "mix_hc": mix, "sinkhorn_iters": 20})
         cost_10 = _mhc_pre_cost(op_10)
@@ -601,10 +605,10 @@ class TestSinkhornScaling:
     def test_sinkhorn_invariant_to_mix_hc(self):
         b, s, h, hc = 1, 4096, 7168, 4
         it = 20
-        op_a = Op(name="test", kind="mhc_pre", inputs=[], outputs=[],
+        op_a = SimpleNamespace(name="test", kind="mhc_pre", inputs=[], outputs=[],
                    meta={"b": b, "s": s, "h": h, "hc": hc,
                          "mix_hc": (2 + hc) * hc, "sinkhorn_iters": it})
-        op_b = Op(name="test", kind="mhc_pre", inputs=[], outputs=[],
+        op_b = SimpleNamespace(name="test", kind="mhc_pre", inputs=[], outputs=[],
                    meta={"b": b, "s": s, "h": h, "hc": hc,
                          "mix_hc": 999, "sinkhorn_iters": it})
         cost_a = _mhc_pre_cost(op_a)
@@ -771,8 +775,8 @@ class TestE2EMhc:
 
         if no_report is None:
             from python.zrt.training.spec.strategy import Strategy
-            from python.zrt.training.ir.builders import build_graph
-            from python.zrt.training.models.flops import total_training_flops, forward_backward_flops, op_cost
+            from python.zrt.training.ir.opgraph_builder import build_opgraph
+            from python.zrt.training.models.flops import total_training_flops, forward_backward_flops, op_cost, _iter_ops
             from python.zrt.training.models.memory import memory_breakdown
 
             model_no = ModelSpec(
@@ -788,11 +792,11 @@ class TestE2EMhc:
             )
             system = _make_system()
             strategy = Strategy(tp=1, pp=1, dp=4, micro_batch=1, global_batch=4)
-            graph_no = build_graph(model_no, strategy)
-            graph_hc = build_graph(model_hc, strategy)
+            graph_no = build_opgraph(model_no, strategy)
+            graph_hc = build_opgraph(model_hc, strategy)
 
             hc_fused = {}
-            for op in graph_hc.ops:
+            for op in _iter_ops(graph_hc):
                 fused_name = op.kind.replace("mhc_", "hc_") if op.kind.startswith("mhc_") else op.kind
                 if fused_name.startswith("hc_"):
                     hc_fused.setdefault(fused_name, {"count": 0, "total_flops": 0.0})
@@ -801,7 +805,7 @@ class TestE2EMhc:
                     hc_fused[fused_name]["total_flops"] += cost.fwd_cube_flops + cost.fwd_vector_flops
 
             no_fused = {}
-            for op in graph_no.ops:
+            for op in _iter_ops(graph_no):
                 fused_name = op.kind.replace("mhc_", "hc_") if op.kind.startswith("mhc_") else op.kind
                 if fused_name.startswith("hc_"):
                     no_fused.setdefault(fused_name, {"count": 0, "total_flops": 0.0})

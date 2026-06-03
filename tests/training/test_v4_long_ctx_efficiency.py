@@ -47,7 +47,7 @@ def _kv_cache_total(model) -> float:
 
 @pytest.fixture
 def v32():
-    model, _, _ = load_specs(
+    model, _, _, _ = load_specs(
         "python/zrt/training/configs/deepseek_v3_2_3d_h100.yaml"
     )
     return model
@@ -55,7 +55,7 @@ def v32():
 
 @pytest.fixture
 def v4_pro():
-    model, _, _ = load_specs(
+    model, _, _, _ = load_specs(
         "python/zrt/training/configs/deepseek_v4_pro_3d_h100.yaml"
     )
     return model
@@ -63,7 +63,7 @@ def v4_pro():
 
 @pytest.fixture
 def v4_flash():
-    model, _, _ = load_specs(
+    model, _, _, _ = load_specs(
         "python/zrt/training/configs/deepseek_v4_flash_3d_h100.yaml"
     )
     return model

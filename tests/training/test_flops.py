@@ -1,10 +1,11 @@
 """Test FLOPs model — 6P rule, matmul cost, HFU metric."""
 
+from types import SimpleNamespace
+
 import pytest
-from zrt.training.ir.builders import build_graph
-from zrt.training.ir.training_graph import Op
+from zrt.training.ir.opgraph_builder import build_opgraph
 from zrt.training.compose.stage import op_to_time
-from zrt.training.models.flops import OpCost, op_cost, total_training_flops, recompute_overhead_flops
+from zrt.training.models.flops import OpCost, op_cost, total_training_flops, recompute_overhead_flops, _iter_ops
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import ModelSpec, LayerKind
 from zrt.training.spec.strategy import RecomputePolicy, Strategy
@@ -14,7 +15,8 @@ from zrt.training.spec.system import GPU, SystemSpec
 
 def test_matmul_cost():
     """Matmul: fwd = dx = dw = 2*m*n*k."""
-    op = Op(name="test_mm", kind="matmul", meta={"m": 1024, "n": 4096, "k": 4096})
+    op = SimpleNamespace(name="test_mm", kind="matmul", meta={"m": 1024, "n": 4096, "k": 4096},
+                         inputs=[], outputs=[], layer_id=-1, layer_kind=LayerKind.DENSE, component=None)
     model = ModelSpec(
         hidden=4096, ffn=16384, num_heads=32, num_kv_heads=32,
         head_dim=128, vocab=32000, seq_len=2048,
@@ -29,9 +31,9 @@ def test_matmul_cost():
 
 def test_attn_core_cost():
     """Attention core: causal cube_fwd = 2*b*s^2*h*d, vector_fwd = 5*b*h*s^2."""
-    op = Op(name="test_attn", kind="attn_core", meta={
+    op = SimpleNamespace(name="test_attn", kind="attn_core", meta={
         "b": 1, "s": 2048, "heads": 32, "head_dim": 128, "causal": True,
-    })
+    }, inputs=[], outputs=[], layer_id=-1, layer_kind=LayerKind.DENSE, component=None)
     model = ModelSpec(
         hidden=4096, ffn=16384, num_heads=32, num_kv_heads=32,
         head_dim=128, vocab=32000, seq_len=2048,
@@ -49,9 +51,9 @@ def test_attn_core_cost():
 
 def test_attn_core_cost_uses_model_compression_ratio():
     """Compressed attention scales fwd and backward attention-core FLOPs."""
-    op = Op(name="test_attn", kind="attn_core", meta={
+    op = SimpleNamespace(name="test_attn", kind="attn_core", meta={
         "b": 1, "s": 1024, "heads": 16, "head_dim": 128, "causal": True,
-    })
+    }, inputs=[], outputs=[], layer_id=-1, layer_kind=LayerKind.DENSE, component=None)
     model = ModelSpec(
         hidden=2048, ffn=8192, num_heads=16, num_kv_heads=16,
         head_dim=128, vocab=32000, seq_len=1024,
@@ -69,10 +71,10 @@ def test_attn_core_cost_uses_model_compression_ratio():
 
 def test_attn_core_cost_op_ratio_overrides_model_ratio():
     """Per-op metadata can override a model-level compression ratio."""
-    op = Op(name="test_attn", kind="attn_core", meta={
+    op = SimpleNamespace(name="test_attn", kind="attn_core", meta={
         "b": 1, "s": 512, "heads": 8, "head_dim": 128,
         "causal": True, "attn_compression_ratio": 0.5,
-    })
+    }, inputs=[], outputs=[], layer_id=-1, layer_kind=LayerKind.DENSE, component=None)
     model = ModelSpec(
         hidden=1024, ffn=4096, num_heads=8, num_kv_heads=8,
         head_dim=128, vocab=32000, seq_len=512,
@@ -88,7 +90,8 @@ def test_attn_core_cost_op_ratio_overrides_model_ratio():
 
 def test_memory_bound_cost():
     """Memory-bound ops (ln, softmax, etc.) should have byte traffic."""
-    op = Op(name="test_ln", kind="ln", meta={"bytes_fwd": 1000})
+    op = SimpleNamespace(name="test_ln", kind="ln", meta={"bytes_fwd": 1000},
+                         inputs=[], outputs=[], layer_id=-1, layer_kind=LayerKind.DENSE, component=None)
     model = ModelSpec(
         hidden=4096, ffn=16384, num_heads=32, num_kv_heads=32,
         head_dim=128, vocab=32000, seq_len=2048,
@@ -136,7 +139,7 @@ def test_6p_rule():
         ),
         nodes=1, gpus_per_node=1,
     )
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
 
     total = total_training_flops(graph, model, strategy, system)
 
@@ -153,7 +156,8 @@ def test_6p_rule():
 
 def test_unknown_op_zero_cost():
     """Unknown op kinds should return zero cost."""
-    op = Op(name="unknown", kind="custom_op", meta={})
+    op = SimpleNamespace(name="unknown", kind="custom_op", meta={},
+                         inputs=[], outputs=[], layer_id=-1, layer_kind=LayerKind.DENSE, component=None)
     model = ModelSpec(
         hidden=4096, ffn=16384, num_heads=32, num_kv_heads=32,
         head_dim=128, vocab=32000, seq_len=2048,
@@ -200,7 +204,7 @@ def test_moe_mfu_is_sane():
     from zrt.training.search.estimator import estimate
 
     # Run estimate on deepseek_v3 config
-    model, system, strategy = load_specs("python/zrt/training/configs/llama3_70b_3d.yaml")
+    model, system, strategy, _capture = load_specs("python/zrt/training/configs/llama3_70b_3d.yaml")
 
     # Temporarily make it MoE-like for testing
     from dataclasses import replace
@@ -279,11 +283,11 @@ def test_hfu_exceeds_mfu_with_selective_recompute():
         recompute=RecomputePolicy(per_layer={"dense": {"attn"}}),
     )
 
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
     overhead = recompute_overhead_flops(graph, model, strategy, system)
     assert overhead > 0, "Selective recompute should produce nonzero overhead FLOPs"
 
-    report = estimate(model, system, strategy)
+    report = estimate(model, system, strategy, graph=graph)
     assert report.hfu > report.mfu, \
         f"HFU ({report.hfu}) should exceed MFU ({report.mfu}) with selective recompute"
 
@@ -305,7 +309,7 @@ def test_recompute_overhead_zero_by_default():
         ),
         nodes=1, gpus_per_node=1,
     )
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
 
     assert recompute_overhead_flops(graph, model, strategy, system) == 0.0
 
@@ -330,7 +334,7 @@ def test_recompute_overhead_full_recompute():
         ),
         nodes=1, gpus_per_node=1,
     )
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
 
     overhead = recompute_overhead_flops(graph, model, strategy, system)
     total = total_training_flops(graph, model, strategy, system)
@@ -369,8 +373,10 @@ def test_selective_recompute_increases_step_time():
         recompute=RecomputePolicy(per_layer={"dense": {"attn"}}),
     )
 
-    r_no = estimate(model, system, strat_no_rc)
-    r_sel = estimate(model, system, strat_selective)
+    graph_no_rc = build_opgraph(model, strat_no_rc)
+    graph_selective = build_opgraph(model, strat_selective)
+    r_no = estimate(model, system, strat_no_rc, graph=graph_no_rc)
+    r_sel = estimate(model, system, strat_selective, graph=graph_selective)
 
     # Selective recompute re-runs attention forward → longer step time
     assert r_sel.step_time_ms > r_no.step_time_ms, \
@@ -405,7 +411,7 @@ def test_layer_kind_scoped_recompute():
         tp=1, pp=1, dp=1, micro_batch=1, global_batch=1,
         recompute=RecomputePolicy(per_layer={"moe": {"attn"}}),
     )
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
 
     overhead = recompute_overhead_flops(graph, model, strategy, system)
     # Should be nonzero (MOE layer's attention ops are recomputed)
@@ -453,7 +459,7 @@ def _fa_kernel_fwd_flops(graph, model, system, M):
     from zrt.training.models.flops import _accounted_flops, _is_compute_bound
     FA_KINDS = {"attn_core", "sparse_attn", "hca_attn", "swa_attn"}
     total = 0.0
-    for op in graph.ops:
+    for op in _iter_ops(graph):
         if op.kind in FA_KINDS:
             cost = op_cost(op, model)
             if _is_compute_bound(cost, "fwd", system):
@@ -467,7 +473,7 @@ def _qkv_o_fwd_flops(graph, model, system, M):
     NAMES = ("qkv", "q_a_proj", "q_b_proj", "kv_a_proj", "kv_b_proj",
              "o_proj", "wq_a", "wq_b", "wkv", "wo_a", "wo_b")
     total = 0.0
-    for op in graph.ops:
+    for op in _iter_ops(graph):
         if op.kind == "matmul" and any(k in op.name.lower() for k in NAMES):
             cost = op_cost(op, model)
             if _is_compute_bound(cost, "fwd", system):
@@ -491,7 +497,7 @@ def test_recompute_overhead_excludes_fa_kernel_forward(monkeypatch):
         tp=1, pp=1, dp=1, micro_batch=1, global_batch=1,
         recompute=RecomputePolicy(per_layer={"dense": {"attn"}}),
     )
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
 
     monkeypatch.setattr(
         "zrt.training.models.flops._is_compute_bound",
@@ -525,7 +531,7 @@ def test_attn_core_only_excludes_qkv_o_matmuls(monkeypatch):
         tp=1, pp=1, dp=1, micro_batch=1, global_batch=1,
         recompute=RecomputePolicy(per_layer={"dense": {"attn_core"}}),
     )
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
 
     monkeypatch.setattr(
         "zrt.training.models.flops._is_compute_bound",
@@ -555,7 +561,7 @@ def test_attn_block_includes_qkv_o_matmuls(monkeypatch):
         tp=1, pp=1, dp=1, micro_batch=1, global_batch=1,
         recompute=RecomputePolicy(per_layer={"dense": {"attn_block"}}),
     )
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
 
     monkeypatch.setattr(
         "zrt.training.models.flops._is_compute_bound",
@@ -584,8 +590,8 @@ def test_legacy_attn_alias_matches_attn_block(monkeypatch):
         tp=1, pp=1, dp=1, micro_batch=1, global_batch=1,
         recompute=RecomputePolicy(per_layer={"dense": {"attn_block"}}),
     )
-    graph_l = build_graph(model, strat_legacy)
-    graph_n = build_graph(model, strat_new)
+    graph_l = build_opgraph(model, strat_legacy)
+    graph_n = build_opgraph(model, strat_new)
 
     monkeypatch.setattr(
         "zrt.training.models.flops._is_compute_bound",

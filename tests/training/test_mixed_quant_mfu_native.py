@@ -7,7 +7,7 @@ from zrt.training.spec.model import LayerKind, ModelSpec
 from zrt.training.spec.strategy import OptKind, Strategy
 from zrt.training.spec.system import GPU, SystemSpec
 from zrt.hardware.spec import InterconnectSpec, LinkSpec
-from zrt.training.ir.training_graph import Graph, Op, Tensor
+from zrt.ir.graph import OpGraph
 
 
 def _make_system():
@@ -26,7 +26,7 @@ def _t(name, n):
 
 
 def test_compute_mfu_native_returns_zero_for_empty_graph():
-    g = Graph()
+    g = OpGraph(name="", phase="")
     sys_ = _make_system()
     m = ModelSpec(hidden=128, ffn=256, num_heads=4, num_kv_heads=4, head_dim=32,
                   vocab=1000, seq_len=64, layers=[LayerKind.DENSE])
@@ -36,7 +36,7 @@ def test_compute_mfu_native_returns_zero_for_empty_graph():
 
 
 def test_compute_mfu_native_returns_zero_for_zero_step_time():
-    g = Graph()
+    g = OpGraph(name="", phase="")
     sys_ = _make_system()
     m = ModelSpec(hidden=128, ffn=256, num_heads=4, num_kv_heads=4, head_dim=32,
                   vocab=1000, seq_len=64, layers=[LayerKind.DENSE])

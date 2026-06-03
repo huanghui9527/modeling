@@ -14,8 +14,10 @@ from __future__ import annotations
 import pytest
 
 from zrt.hardware.spec import InterconnectSpec, LinkSpec, TopologyTier
-from zrt.training.ir.training_graph import Collective, Graph
+from types import SimpleNamespace
+
 from zrt.training.models.comm import (
+    CommSpec,
     collective_time,
     collective_time_hierarchical,
     collective_time_multi_tier,
@@ -120,8 +122,8 @@ def test_comm_domain_time_matches_collective_time_multi_tier_directly():
     sys = _three_tier_system(world_size=512)
     s = Strategy(tp=4, cp=2, ep=1, dp=16, pp=4)
     d = CommDomain(system=sys, strategy=s)
-    c = Collective(name="dp_ar", kind="AR", group="DP",
-                   bytes_=64 * 1024 * 1024, inserted_after="end")
+    c = CommSpec(name="dp_ar", kind="AR", group="DP",
+                 bytes_=64 * 1024 * 1024)
     t_domain = d.time(c)
     t_direct = collective_time_multi_tier(c, d.ranks("DP"), sys)
     assert t_domain == pytest.approx(t_direct, rel=1e-12)
@@ -133,8 +135,8 @@ def test_comm_domain_2tier_falls_back_to_legacy_size_only_path():
     sys = _two_tier_system(world_size=64)
     s = Strategy(tp=8, cp=1, ep=1, dp=8, pp=1)
     d = CommDomain(system=sys, strategy=s)
-    c = Collective(name="tp_ag", kind="AG", group="TP",
-                   bytes_=4 * 1024 * 1024, inserted_after="end")
+    c = CommSpec(name="tp_ag", kind="AG", group="TP",
+                 bytes_=4 * 1024 * 1024)
     legacy = collective_time(c, 8, sys.interconnect.intra_node)
     assert d.time(c) == pytest.approx(legacy, rel=1e-12)
 
@@ -142,7 +144,7 @@ def test_comm_domain_2tier_falls_back_to_legacy_size_only_path():
 def test_comm_domain_zero_bytes_yields_zero_time():
     sys = _three_tier_system(512)
     d = CommDomain(system=sys, strategy=Strategy(tp=4, cp=1, ep=1, dp=16, pp=8))
-    c = Collective(name="zero", kind="AG", group="DP", bytes_=0, inserted_after="end")
+    c = CommSpec(name="zero", kind="AG", group="DP", bytes_=0)
     assert d.time(c) == 0.0
 
 
@@ -151,8 +153,8 @@ def test_comm_domain_degenerate_kind_yields_zero_time():
     sys = _three_tier_system(64)
     s = Strategy(tp=1, cp=1, ep=1, dp=64, pp=1)
     d = CommDomain(system=sys, strategy=s)
-    c = Collective(name="tp_noop", kind="AR", group="TP",
-                   bytes_=1024 * 1024, inserted_after="end")
+    c = CommSpec(name="tp_noop", kind="AR", group="TP",
+                 bytes_=1024 * 1024)
     assert d.time(c) == 0.0
 
 
@@ -161,7 +163,7 @@ def test_comm_domain_logs_when_multi_tier_falls_back_for_degenerate_groups(caplo
     # Product mismatch leaves ParallelGroups empty, but DP degree remains non-trivial.
     s = Strategy(tp=2, cp=1, ep=1, dp=8, pp=8)
     d = CommDomain(system=sys, strategy=s)
-    c = Collective(name="dp_ag", kind="AG", group="DP", bytes_=1024, inserted_after="end")
+    c = CommSpec(name="dp_ag", kind="AG", group="DP", bytes_=1024)
 
     caplog.set_level("DEBUG", logger="zrt.training.topology.comm_domain")
 
@@ -190,7 +192,7 @@ def test_total_comm_time_shares_domain_with_caller():
     sys = _three_tier_system(world_size=512)
     s = Strategy(tp=4, cp=2, ep=1, dp=16, pp=4, micro_batch=1, global_batch=64)
     model = _tiny_model()
-    graph = Graph(ops=[], collectives=[])
+    graph = SimpleNamespace(ops=[], collectives=[])
 
     d = CommDomain(system=sys, strategy=s)
     res_with = total_comm_time(graph, model, sys, s, domain=d)
@@ -250,7 +252,7 @@ def test_n_tier_time_uses_max_group_instance_not_rank0_only():
     )
     s = Strategy(tp=4, cp=2, ep=2, dp=8, pp=2)
     d = CommDomain(system=sys, strategy=s)
-    c = Collective("x", "AG", "EXPERT_DP", 100 * 1024 * 1024, "op")
+    c = CommSpec(kind="AG", group="EXPERT_DP", bytes_=100 * 1024 * 1024, name="x")
 
     rank0_time = collective_time_multi_tier(c, d.ranks("EXPERT_DP"), sys)
     expected_max = max(
@@ -285,8 +287,8 @@ def test_pipeline_step_time_builds_one_domain_per_call(monkeypatch):
     sys = _three_tier_system(world_size=512)
     s = Strategy(tp=4, cp=2, ep=1, dp=16, pp=4, micro_batch=1, global_batch=64)
     model = _tiny_model()
-    from zrt.training.ir.builders import build_graph
-    graph = build_graph(model, s)
+    from zrt.training.ir.opgraph_builder import build_opgraph
+    graph = build_opgraph(model, s)
 
     constructions: list[int] = []
     real_init = CommDomain.__init__
@@ -330,7 +332,7 @@ def test_2tier_total_comm_time_unchanged_with_or_without_domain():
     sys = _two_tier_system(world_size=64)
     s = Strategy(tp=8, cp=1, ep=1, dp=8, pp=1, micro_batch=1, global_batch=8)
     model = _tiny_model()
-    graph = Graph(ops=[], collectives=[])
+    graph = SimpleNamespace(ops=[], collectives=[])
     res_a = total_comm_time(graph, model, sys, s)
     d = CommDomain(system=sys, strategy=s)
     res_b = total_comm_time(graph, model, sys, s, domain=d)
@@ -371,10 +373,9 @@ def test_routed_muon_uses_expert_dp_group_not_ep():
     # Cost comparison: AG over expert-DP > AG over EP (more ranks, more
     # bandwidth term). If routed-Muon mistakenly used EP it would be
     # under-priced.
-    from zrt.training.ir.training_graph import Collective
     S = 100 * 1024 * 1024
-    t_edp = d.time(Collective("x", "AG", "EXPERT_DP", S, "op"))
-    t_ep = d.time(Collective("y", "AG", "EP", S, "op"))
+    t_edp = d.time(CommSpec(kind="AG", group="EXPERT_DP", bytes_=S, name="x"))
+    t_ep = d.time(CommSpec(kind="AG", group="EP", bytes_=S, name="y"))
     assert t_edp > t_ep, (
         f"AG over expert-DP ({t_edp*1e6:.1f}µs) must be > AG over EP "
         f"({t_ep*1e6:.1f}µs) — routed-Muon under-priced if reversed"

@@ -1,6 +1,17 @@
-"""Sharding pass — apply TP/CP/EP sharding to IR and insert collectives."""
+"""Sharding pass — apply TP/CP/EP sharding to IR and insert collectives.
+
+Entry points:
+  - :func:`insert_collectives` — legacy Graph path
+  - :func:`insert_collectives_opgraph` — OpGraph-native path (Phase B2)
+"""
 
 from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from zrt.ir.graph import OpGraph
+    from zrt.ir.node import OpNode
 
 from zrt.training.ir.training_graph import Collective, Graph
 from zrt.training.spec.model import LayerKind, ModelSpec
@@ -529,6 +540,9 @@ def _insert_ep_collectives(
         for i in range(start, end):
             op = graph.ops[i]
 
+            if op.kind == "mega_moe":
+                continue
+
             # A2A before routed expert FFN
             if op.kind == "matmul" and "routed_expert" in op.name:
                 collectives.append(Collective(
@@ -564,7 +578,18 @@ def _apply_tp_sharding(
     for i in range(start, end):
         op = graph.ops[i]
 
-        if op.kind == "matmul":
+        if op.kind == "mega_moe":
+            k = op.meta.get("k", 0)
+            n = op.meta.get("n", 0)
+            if k > 0:
+                op.meta["k_local"] = k // shard.tp
+            if n > 0:
+                n_local = n // shard.tp
+                op.meta["n_local"] = n_local
+                for t in op.outputs:
+                    if t.shape_logical and t.shape_logical[-1] == n:
+                        t.shape_local = (t.shape_logical[0], n_local)
+        elif op.kind == "matmul":
             m = op.meta.get("m", 0)
             n = op.meta.get("n", 0)
             k = op.meta.get("k", 0)
@@ -728,7 +753,10 @@ def _apply_cp_sharding(
                 if t.shape_logical[0] == seq:
                     t.shape_local = (max(1, t.shape_local[0] // shard.cp),) + t.shape_local[1:]
 
-        if op.kind == "matmul":
+        if op.kind == "mega_moe":
+            if "m" in op.meta:
+                op.meta["m"] = op.meta["m"] // shard.cp
+        elif op.kind == "matmul":
             # For meta-authoritative matmuls (grouped/fused where meta k != input shape),
             # _matmul_cost reads m from meta — must divide it here.
             meta_k = op.meta.get("k", 0)
@@ -831,6 +859,15 @@ def _apply_ep_sharding(
         if op.kind == "matmul" and "routed_expert" in op.name:
             pass  # intentionally left unscaled — see comment above
 
+        if op.kind == "mega_moe":
+            num_experts = op.meta.get("num_experts", 0)
+            if num_experts % shard.ep != 0:
+                raise ValueError(
+                    f"num_experts({num_experts}) not divisible by EP({shard.ep})"
+                )
+            op.meta["ep"] = shard.ep
+            op.meta["experts_per_rank"] = num_experts // shard.ep
+
         # Router output: num_experts -> experts_per_rank
         if op.kind == "matmul" and "router" in op.name:
             for t in op.outputs:
@@ -838,3 +875,557 @@ def _apply_ep_sharding(
                     # Router output: (seq, num_experts) -> (seq, experts_per_rank)
                     if t.shape_logical[1] == num_experts:
                         t.shape_local = (t.shape_logical[0], experts_per_rank)
+
+
+# ── OpGraph-native sharding pass (Phase B2) ─────────────────────────────────
+
+def insert_collectives_opgraph(
+    graph: "OpGraph", model: ModelSpec, strategy: Strategy,
+) -> None:
+    """Insert TP/CP/EP collectives into the OpGraph IN-PLACE.
+
+    This is the OpGraph-native version of :func:`insert_collectives`.
+    It creates comm.* OpNodes and inserts them into the graph at the
+    appropriate positions, then applies TP/CP/EP sharding to tensor shapes.
+
+    Parameters
+    ----------
+    graph : OpGraph
+        The computation graph to modify in-place.
+    model : ModelSpec
+        Model architecture specification.
+    strategy : Strategy
+        Parallel strategy configuration.
+    """
+    from zrt.ir.graph import OpGraph
+    from zrt.ir.node import OpNode
+    from zrt.ir.types import TensorMeta
+    from zrt.ir.edge import Edge
+
+    shard = ShardPlan(strategy)
+    comm_nodes: list[tuple[str, OpNode, str]] = []
+    comm_counter = [0]
+
+    if shard.has_tp:
+        _insert_tp_collectives_opgraph(graph, shard, model, comm_nodes, comm_counter)
+
+    if shard.has_cp:
+        _insert_cp_collectives_opgraph(graph, shard, model, comm_nodes, comm_counter)
+
+    if shard.has_ep:
+        _insert_ep_collectives_opgraph(graph, shard, model, strategy, comm_nodes, comm_counter)
+
+    for ref_id, comm_node, position in comm_nodes:
+        ref_node = graph.nodes.get(ref_id)
+        if ref_node:
+            comm_node.layer = ref_node.layer
+        graph.add_node(comm_node)
+        if position == "after":
+            graph.add_edge(Edge(src=ref_id, src_idx=0, dst=comm_node.id, dst_idx=0))
+        else:
+            graph.add_edge(Edge(src=comm_node.id, src_idx=0, dst=ref_id, dst_idx=0))
+
+    _apply_global_hc_sharding_opgraph(graph, strategy, model.seq_len)
+    _apply_global_token_op_sharding_opgraph(graph, strategy)
+    _apply_global_lm_head_sharding_opgraph(graph, strategy)
+
+
+def _insert_tp_collectives_opgraph(
+    graph: "OpGraph", shard: ShardPlan, model: ModelSpec,
+    comm_nodes: list[tuple[str, "OpNode", str]], comm_counter: list[int],
+) -> None:
+    """Insert TP collectives (AG/RS pairs) into the OpGraph."""
+    from zrt.ir.node import OpNode
+
+    seq = model.seq_len
+    h = model.hidden
+    h_attn = model.num_heads * model.head_dim
+    h_kv = model.num_kv_heads * model.head_dim
+    ffn = model.ffn
+    act_bytes = model.act_dtype.bytes
+    attn_act_bytes = model.effective_attn_act_dtype().bytes
+    moe_act_bytes = model.effective_moe_act_dtype().bytes
+
+    if shard.cp > 1:
+        seq = seq // shard.cp
+
+    for node in graph.nodes.values():
+        if node.op_type.startswith("comm."):
+            continue
+
+        layer_id = int(node.layer) if node.layer and node.layer.isdigit() else -1
+        if layer_id < 0:
+            continue
+
+        ffn_bytes_per = moe_act_bytes if _is_moe_layer(model, layer_id) else act_bytes
+        ag_attn_bytes = seq * h * attn_act_bytes
+        rs_attn_bytes = seq * h * attn_act_bytes
+        ag_ffn_bytes = seq * h * ffn_bytes_per
+        rs_ffn_bytes = seq * h * ffn_bytes_per
+
+        spec_kind = node.attrs.get("spec_kind", node.op_type)
+        if spec_kind == "matmul":
+            if "qkv" in node.id:
+                comm_counter[0] += 1
+                comm_nodes.append((node.id, _make_comm_node_opgraph(
+                    f"ag_{node.id}", "AG", "TP", ag_attn_bytes, comm_counter[0], "both",
+                    inserted_after=node.id), "after"))
+
+            if "o_proj" in node.id:
+                comm_counter[0] += 1
+                comm_nodes.append((node.id, _make_comm_node_opgraph(
+                    f"rs_{node.id}", "RS", "TP", rs_attn_bytes, comm_counter[0], "both",
+                    inserted_after=node.id), "after"))
+
+            if "up_proj" in node.id or "shared_up_proj" in node.id:
+                comm_counter[0] += 1
+                comm_nodes.append((node.id, _make_comm_node_opgraph(
+                    f"ag_{node.id}", "AG", "TP", ag_ffn_bytes, comm_counter[0], "both",
+                    inserted_after=node.id), "after"))
+
+            if "down_proj" in node.id or "shared_down_proj" in node.id:
+                comm_counter[0] += 1
+                comm_nodes.append((node.id, _make_comm_node_opgraph(
+                    f"rs_{node.id}", "RS", "TP", rs_ffn_bytes, comm_counter[0], "both",
+                    inserted_after=node.id), "after"))
+
+    _apply_tp_sharding_opgraph(graph, shard, h, h_attn, h_kv, ffn, seq, act_bytes)
+
+
+def _insert_cp_collectives_opgraph(
+    graph: "OpGraph", shard: ShardPlan, model: ModelSpec,
+    comm_nodes: list[tuple[str, "OpNode", str]], comm_counter: list[int],
+) -> None:
+    """Insert CP collectives into the OpGraph."""
+    from zrt.ir.node import OpNode
+
+    h = model.hidden
+    if shard.tp > 1:
+        h = h // shard.tp
+    act_bytes = model.effective_attn_act_dtype().bytes
+    cp = shard.cp
+
+    if shard.cp_kind == CPKind.NONE:
+        _apply_cp_sharding_opgraph(graph, shard, model.seq_len, model.hidden)
+        return
+
+    for node in graph.nodes.values():
+        if node.op_type.startswith("comm."):
+            continue
+
+        spec_kind = node.attrs.get("spec_kind", node.op_type)
+        if spec_kind not in ("attn_core", "sparse_attn", "hca_attn", "swa_attn"):
+            continue
+
+        if shard.cp_kind == CPKind.ULYSSES:
+            a2a_bytes = (model.seq_len // cp) * h * act_bytes
+            comm_counter[0] += 1
+            comm_nodes.append((node.id, _make_comm_node_opgraph(
+                f"a2a_fwd_before_{node.id}", "A2A", "CP", a2a_bytes, comm_counter[0], "fwd",
+                inserted_before=node.id), "before"))
+            comm_counter[0] += 1
+            comm_nodes.append((node.id, _make_comm_node_opgraph(
+                f"a2a_fwd_after_{node.id}", "A2A", "CP", a2a_bytes, comm_counter[0], "fwd",
+                inserted_after=node.id), "after"))
+            comm_counter[0] += 1
+            comm_nodes.append((node.id, _make_comm_node_opgraph(
+                f"a2a_bwd_before_{node.id}", "A2A", "CP", a2a_bytes, comm_counter[0], "bwd",
+                inserted_before=node.id), "before"))
+            comm_counter[0] += 1
+            comm_nodes.append((node.id, _make_comm_node_opgraph(
+                f"a2a_bwd_after_{node.id}", "A2A", "CP", a2a_bytes, comm_counter[0], "bwd",
+                inserted_after=node.id), "after"))
+
+        elif shard.cp_kind == CPKind.RING:
+            p2p_bytes = (model.seq_len // cp) * h * act_bytes
+            comm_counter[0] += 1
+            comm_nodes.append((node.id, _make_comm_node_opgraph(
+                f"p2p_ring_fwd_{node.id}", "P2P", "CP", p2p_bytes, comm_counter[0], "fwd",
+                rounds=cp, overlap=True, inserted_before=node.id), "before"))
+            comm_counter[0] += 1
+            comm_nodes.append((node.id, _make_comm_node_opgraph(
+                f"p2p_ring_bwd_{node.id}", "P2P", "CP", p2p_bytes, comm_counter[0], "bwd",
+                rounds=cp, overlap=True, inserted_before=node.id), "before"))
+
+    _apply_cp_sharding_opgraph(graph, shard, model.seq_len, model.hidden)
+
+
+def _insert_ep_collectives_opgraph(
+    graph: "OpGraph", shard: ShardPlan, model: ModelSpec, strategy: Strategy,
+    comm_nodes: list[tuple[str, "OpNode", str]], comm_counter: list[int],
+) -> None:
+    """Insert EP collectives (A2A pairs for expert parallel) into the OpGraph."""
+    from zrt.ir.node import OpNode
+
+    h = model.hidden
+    if shard.tp > 1:
+        h = h // shard.tp
+    seq = model.seq_len
+    if shard.cp > 1:
+        seq = seq // shard.cp
+    moe_ffn = model.moe_ffn if model.moe_ffn > 0 else model.ffn
+    act_bytes = model.effective_moe_act_dtype().bytes
+
+    micro_batch = strategy.micro_batch
+    topk = model.top_k
+    a2a_bytes = micro_batch * seq * h * topk * act_bytes
+
+    for node in graph.nodes.values():
+        if node.op_type.startswith("comm."):
+            continue
+
+        layer_id = int(node.layer) if node.layer and node.layer.isdigit() else -1
+        if layer_id < 0 or layer_id >= len(model.layers):
+            continue
+        if model.layers[layer_id].value != "moe":
+            continue
+
+        spec_kind = node.attrs.get("spec_kind", node.op_type)
+        if spec_kind == "matmul" and "routed_expert" in node.id:
+            comm_counter[0] += 1
+            comm_nodes.append((node.id, _make_comm_node_opgraph(
+                f"a2a_before_{node.id}", "A2A", "EP", a2a_bytes, comm_counter[0], "both",
+                inserted_before=node.id), "before"))
+            comm_counter[0] += 1
+            comm_nodes.append((node.id, _make_comm_node_opgraph(
+                f"a2a_after_{node.id}", "A2A", "EP", a2a_bytes, comm_counter[0], "both",
+                inserted_after=node.id), "after"))
+
+    _apply_ep_sharding_opgraph(graph, shard, model.num_experts, model.top_k)
+
+
+def _make_comm_node_opgraph(
+    name: str, kind: str, group: str, bytes_: int, counter: int, phase: str,
+    rounds: int = 1, overlap: bool = False, inserted_after: str = None,
+    inserted_before: str = None,
+) -> "OpNode":
+    """Create a comm OpNode."""
+    from zrt.ir.node import OpNode
+
+    _KIND_TO_COMM_OP = {
+        "AG": "comm.all_gather",
+        "RS": "comm.reduce_scatter",
+        "AR": "comm.all_reduce",
+        "A2A": "comm.all_to_all",
+        "P2P": "comm.send_recv",
+    }
+    op_type = _KIND_TO_COMM_OP.get(kind, f"comm.{kind.lower()}")
+
+    attrs = {
+        "comm_kind": kind,
+        "comm_group": group,
+        "comm_bytes": bytes_,
+        "comm_rounds": rounds,
+        "comm_overlap": overlap,
+        "comm_phase": phase,
+        "spec_kind": "comm",
+    }
+    if inserted_after:
+        attrs["inserted_after"] = inserted_after
+    if inserted_before:
+        attrs["inserted_before"] = inserted_before
+
+    return OpNode(
+        id=f"comm_{counter}",
+        op_type=op_type,
+        attrs=attrs,
+        scope="",
+        category="communication",
+        component="comm",
+        layer="",
+        name=name,
+    )
+
+
+def _apply_tp_sharding_opgraph(
+    graph: "OpGraph", shard: ShardPlan,
+    h: int, h_attn: int, h_kv: int, ffn: int, seq: int, act_bytes: int,
+) -> None:
+    """Adjust tensor shape_local for TP sharding on OpGraph nodes."""
+    if shard.tp <= 1:
+        return
+
+    for node in graph.nodes.values():
+        if node.op_type.startswith("comm."):
+            continue
+
+        spec_kind = node.attrs.get("spec_kind", node.op_type)
+        if spec_kind == "matmul":
+            m = node.attrs.get("m", 0)
+            n = node.attrs.get("n", 0)
+            k = node.attrs.get("k", 0)
+
+            col_parallel = any(p in node.id for p in (
+                "qkv", "q_a_proj", "q_b_proj", "kv_a_proj",
+                "wq_a", "wq_b", "wkv",
+                "up_proj", "gate_proj", "shared_up_proj", "shared_gate_proj",
+                "comp_wkv", "comp_wgate",
+                "idx_wq_b", "idx_weights", "idx_comp_wkv", "idx_comp_wgate",
+            ))
+            row_parallel = any(p in node.id for p in (
+                "o_proj", "down_proj", "shared_down_proj",
+                "wo_a", "wo_b", "kv_b_proj",
+            ))
+
+            if col_parallel:
+                n_local = n // shard.tp
+                updated = False
+                for t in node.outputs:
+                    if t.shape and t.shape[-1] == n:
+                        t.shape_local = (t.shape[0], n_local)
+                        updated = True
+                if not updated:
+                    node.attrs["n_local"] = n_local
+            elif row_parallel:
+                k_local = k // shard.tp
+                updated = False
+                for t in node.inputs:
+                    if t.shape and t.shape[-1] == k:
+                        t.shape_local = (t.shape[0], k_local)
+                        updated = True
+                if not updated:
+                    node.attrs["k_local"] = k_local
+            elif "router" in node.id:
+                n_local = n // shard.tp
+                for t in node.outputs:
+                    if t.shape and t.shape[-1] == n:
+                        t.shape_local = (t.shape[0], n_local)
+            elif "routed_expert" in node.id:
+                k_local = k // shard.tp
+                n_local = n // shard.tp
+                node.attrs["k_local"] = k_local
+                for t in node.inputs:
+                    if t.shape and t.shape[-1] == k:
+                        t.shape_local = (t.shape[0], k_local)
+                for t in node.outputs:
+                    if t.shape and t.shape[-1] == n:
+                        t.shape_local = (t.shape[0], n_local)
+        elif spec_kind in ("attn_core", "sparse_attn", "hca_attn", "swa_attn"):
+            if "heads" in node.attrs:
+                heads_before_tp = node.attrs["heads"]
+                node.attrs["heads"] = max(1, node.attrs["heads"] // shard.tp)
+                node.attrs["heads_tp"] = node.attrs["heads"]
+                node.attrs["heads_before_tp"] = heads_before_tp
+            if "h_kv" in node.attrs:
+                node.attrs["h_kv"] = max(1, node.attrs["h_kv"] // shard.tp)
+            for t in node.inputs + node.outputs:
+                if t.shape and t.shape[-1] in (h_attn, h_kv):
+                    t.shape_local = (t.shape[0], max(1, t.shape[-1] // shard.tp))
+        elif spec_kind in ("mhc_pre", "mhc_post", "mhc_head", "hc_expand"):
+            _shard_hc_sequence_opgraph(node, shard.tp, seq)
+        elif spec_kind == "indexer_topk":
+            ih = node.attrs.get("ih", 0)
+            if ih > 0:
+                ih_local = max(1, ih // shard.tp)
+                node.attrs["ih_local"] = ih_local
+                node.attrs["world_factor"] = shard.tp
+                id_ = node.attrs.get("id", 0)
+                for t in node.inputs:
+                    if "idx_q" in t.id and t.shape:
+                        t.shape_local = (t.shape[0], ih_local * id_)
+                    elif "idx_w" in t.id and t.shape:
+                        t.shape_local = (t.shape[0], ih_local)
+                kv_len = node.attrs.get("kv_len", node.attrs.get("s", 0))
+                idx_q_bytes = node.attrs.get("s", 0) * ih_local * id_ * 2
+                idx_kv_bytes = kv_len * id_ * 2
+                idx_w_bytes = node.attrs.get("s", 0) * ih_local * 2
+                idx_out_bytes = node.attrs.get("s", 0) * node.attrs.get("topk", 0) * 2
+                node.attrs["bytes_fwd"] = idx_q_bytes + idx_kv_bytes + idx_w_bytes + idx_out_bytes
+        elif spec_kind == "lm_head":
+            n = node.attrs.get("n", 0)
+            if n > 0:
+                n_local = n // shard.tp
+                node.attrs["n_local"] = n_local
+                for t in node.outputs:
+                    if t.shape and t.shape[-1] == n:
+                        t.shape_local = (t.shape[0], n_local)
+            if "bytes_fwd" in node.attrs:
+                node.attrs["bytes_fwd"] = int(node.attrs["bytes_fwd"]) // shard.tp
+        elif spec_kind == "compressor_pool":
+            d = node.attrs.get("d", 0)
+            if d > 0:
+                d_local = max(1, d // shard.tp)
+                node.attrs["d_local"] = d_local
+                node.attrs["world_factor"] = shard.tp
+                if "bytes_fwd" in node.attrs:
+                    node.attrs["bytes_fwd"] = node.attrs["bytes_fwd"] // shard.tp
+        elif spec_kind in ("ln", "rmsnorm", "rope", "swiglu", "add"):
+            for t in node.inputs + node.outputs:
+                if t.shape and t.shape[-1] in (h, h_attn, h_kv, ffn):
+                    t.shape_local = (t.shape[0], max(1, t.shape[-1] // shard.tp))
+
+
+def _apply_cp_sharding_opgraph(
+    graph: "OpGraph", shard: ShardPlan, seq: int, hidden: int,
+) -> None:
+    """Adjust tensor shape_local for CP sharding on OpGraph nodes."""
+    if not shard.has_cp:
+        return
+
+    for node in graph.nodes.values():
+        if node.op_type.startswith("comm."):
+            continue
+
+        for t in node.inputs + node.outputs:
+            if t.shape and len(t.shape) > 0:
+                if t.shape[0] == seq:
+                    t.shape_local = (max(1, (t.shape_local[0] if t.shape_local else t.shape[0]) // shard.cp),) + (t.shape_local[1:] if t.shape_local and len(t.shape_local) > 1 else t.shape[1:])
+
+        spec_kind = node.attrs.get("spec_kind", node.op_type)
+        if spec_kind == "matmul":
+            meta_k = node.attrs.get("k", 0)
+            if "m" in node.attrs and meta_k > 0 and node.inputs and node.inputs[0].shape and node.inputs[0].shape[-1] != meta_k:
+                node.attrs["m"] = node.attrs["m"] // shard.cp
+        elif spec_kind in ("attn_core", "sparse_attn", "hca_attn", "swa_attn"):
+            heads_tp = node.attrs.get("heads_tp", node.attrs.get("heads", 0))
+
+            if shard.cp_kind == CPKind.ULYSSES:
+                node.attrs["heads"] = max(1, heads_tp // shard.cp)
+                node.attrs["heads_gathered_by_cp"] = False
+            elif shard.cp_kind == CPKind.HYBRID:
+                if "s" in node.attrs:
+                    node.attrs["s"] = node.attrs["s"] // shard.cp
+                node.attrs["heads"] = max(1, heads_tp // shard.cp)
+                node.attrs["heads_gathered_by_cp"] = False
+                node.attrs["cp_tiles"] = shard.cp
+            elif shard.cp_kind == CPKind.RING:
+                if "s" in node.attrs:
+                    node.attrs["s"] = node.attrs["s"] // shard.cp
+                node.attrs["heads_gathered_by_cp"] = False
+                node.attrs["cp_tiles"] = shard.cp
+            else:
+                if "s" in node.attrs:
+                    node.attrs["s"] = node.attrs["s"] // shard.cp
+        elif spec_kind in ("mhc_pre", "mhc_post", "mhc_head", "hc_expand"):
+            if "s" in node.attrs and node.attrs["s"] > 0:
+                node.attrs["s"] = max(1, node.attrs["s"] // shard.cp)
+            if "bytes_fwd" in node.attrs:
+                node.attrs["bytes_fwd"] = max(1, int(node.attrs["bytes_fwd"]) // shard.cp)
+        elif spec_kind == "compressor_pool":
+            s = node.attrs.get("s", 0)
+            if s > 0:
+                node.attrs["s"] = s // shard.cp
+                node.attrs["world_factor"] = shard.cp
+            if "bytes_fwd" in node.attrs:
+                node.attrs["bytes_fwd"] = int(node.attrs["bytes_fwd"]) // shard.cp
+        elif spec_kind == "indexer_topk":
+            s = node.attrs.get("s", 0)
+            if s > 0:
+                node.attrs["s"] = s // shard.cp
+                node.attrs["world_factor"] = shard.cp
+            kv_len = node.attrs.get("kv_len", 0)
+            id_ = node.attrs.get("id", 0)
+            topk = node.attrs.get("topk", 0)
+            ih = node.attrs.get("ih_local", node.attrs.get("ih", 0))
+            s_local = s // shard.cp if s > 0 else 0
+            idx_q_bytes = s_local * ih * id_ * 2
+            idx_kv_bytes = kv_len * id_ * 2
+            idx_w_bytes = s_local * ih * 2
+            idx_out_bytes = s_local * topk * 2
+            node.attrs["bytes_fwd"] = idx_q_bytes + idx_kv_bytes + idx_w_bytes + idx_out_bytes
+
+
+def _apply_ep_sharding_opgraph(
+    graph: "OpGraph", shard: ShardPlan,
+    num_experts: int, top_k: int,
+) -> None:
+    """Adjust tensor shape_local for EP sharding on OpGraph nodes."""
+    if not shard.has_ep:
+        return
+
+    experts_per_rank = num_experts // shard.ep
+
+    for node in graph.nodes.values():
+        if node.op_type.startswith("comm."):
+            continue
+
+        spec_kind = node.attrs.get("spec_kind", node.op_type)
+        if spec_kind == "matmul" and "router" in node.id:
+            for t in node.outputs:
+                if len(t.shape) > 1:
+                    if t.shape[1] == num_experts:
+                        t.shape_local = (t.shape[0], experts_per_rank)
+
+
+def _shard_hc_sequence_opgraph(node: "OpNode", factor: int, seq: int) -> None:
+    """Shard Hyper-Connection token dimension by an additional factor (OpGraph version)."""
+    if factor <= 1:
+        return
+    if "s" in node.attrs and node.attrs["s"] > 0:
+        node.attrs["s"] = max(1, node.attrs["s"] // factor)
+    if "bytes_fwd" in node.attrs:
+        node.attrs["bytes_fwd"] = max(1, int(node.attrs["bytes_fwd"]) // factor)
+    for t in node.inputs + node.outputs:
+        if t.shape_local:
+            t.shape_local = (max(1, t.shape_local[0] // factor),) + t.shape_local[1:]
+
+
+def _apply_global_hc_sharding_opgraph(graph: "OpGraph", strategy: Strategy, seq: int) -> None:
+    """Apply TP/CP token sharding to HC ops outside layer_index (OpGraph version)."""
+    factor = max(1, strategy.tp) * max(1, strategy.cp)
+    if factor <= 1:
+        return
+    for node in graph.nodes.values():
+        if node.op_type.startswith("comm."):
+            continue
+        layer_id = int(node.layer) if node.layer and node.layer.isdigit() else -1
+        spec_kind = node.attrs.get("spec_kind", node.op_type)
+        if layer_id < 0 and spec_kind in ("mhc_pre", "mhc_post", "mhc_head", "hc_expand"):
+            _shard_hc_sequence_opgraph(node, factor, seq)
+
+
+def _apply_global_token_op_sharding_opgraph(graph: "OpGraph", strategy: Strategy) -> None:
+    """Apply CP token sharding to non-lm_head global token ops (OpGraph version)."""
+    factor = max(1, strategy.cp)
+    if factor <= 1:
+        return
+    for node in graph.nodes.values():
+        if node.op_type.startswith("comm."):
+            continue
+        layer_id = int(node.layer) if node.layer and node.layer.isdigit() else -1
+        spec_kind = node.attrs.get("spec_kind", node.op_type)
+        if layer_id < 0 and spec_kind in ("embed", "ln", "rmsnorm"):
+            _shard_global_token_sequence_opgraph(node, factor)
+
+
+def _shard_global_token_sequence_opgraph(node: "OpNode", factor: int) -> None:
+    """Shard the leading token dimension for global sequence-local ops (OpGraph version)."""
+    if factor <= 1:
+        return
+    if "m" in node.attrs and node.attrs["m"] > 0:
+        node.attrs["m"] = max(1, node.attrs["m"] // factor)
+    if "s" in node.attrs and node.attrs["s"] > 0:
+        node.attrs["s"] = max(1, node.attrs["s"] // factor)
+    if "bytes_fwd" in node.attrs:
+        node.attrs["bytes_fwd"] = max(1, int(node.attrs["bytes_fwd"]) // factor)
+    for t in node.inputs + node.outputs:
+        if t.shape_local:
+            t.shape_local = (max(1, t.shape_local[0] // factor),) + t.shape_local[1:]
+
+
+def _apply_global_lm_head_sharding_opgraph(graph: "OpGraph", strategy: Strategy) -> None:
+    """Apply TP vocab and CP sequence sharding to global lm_head (OpGraph version)."""
+    tp = max(1, strategy.tp)
+    cp = max(1, strategy.cp)
+    if tp <= 1 and cp <= 1:
+        return
+    for node in graph.nodes.values():
+        if node.op_type.startswith("comm."):
+            continue
+        layer_id = int(node.layer) if node.layer and node.layer.isdigit() else -1
+        spec_kind = node.attrs.get("spec_kind", node.op_type)
+        if layer_id >= 0 or spec_kind != "lm_head":
+            continue
+        m = node.attrs.get("m", 0)
+        n = node.attrs.get("n", 0)
+        if cp > 1 and m > 0:
+            node.attrs["m"] = max(1, m // cp)
+            for t in node.inputs + node.outputs:
+                if t.shape and t.shape[0] == m:
+                    t.shape_local = (max(1, (t.shape_local[0] if t.shape_local else t.shape[0]) // cp),) + (t.shape_local[1:] if t.shape_local and len(t.shape_local) > 1 else t.shape[1:])
+        if tp > 1 and n > 0:
+            n_local = max(1, n // tp)
+            node.attrs["n_local"] = n_local
+            for t in node.outputs:
+                if t.shape and t.shape[-1] == n:
+                    t.shape_local = (t.shape_local[:-1] if t.shape_local else t.shape[:-1]) + (n_local,)

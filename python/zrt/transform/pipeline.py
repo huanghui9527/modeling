@@ -79,7 +79,7 @@ def build_pipeline(*, fusion: str = "v2") -> TransformPipeline:
     """
     from python.zrt.transform.parallel import (
         TensorParallelPass, ExpertParallelPass, ExpertGroupedMMPass,
-        CommInserterPass, PipelineParallelPass,
+        CommInserterPass, PipelineParallelPass, CoCTilePass,
     )
     from python.zrt.transform.parallel.context_parallel import ContextParallelPass
     from python.zrt.transform.parallel.data_parallel import DataParallelPass
@@ -88,7 +88,7 @@ def build_pipeline(*, fusion: str = "v2") -> TransformPipeline:
         QuantizationPass, EPLBPass, SharedExpertPass, MTPPass,
     )
     from python.zrt.transform.analysis import (
-        FlopsPass, RooflinePass, CommLatencyPass, StreamAssignPass,
+        FlopsPass, RooflinePass, CommLatencyPass, CoCLatencyPass, StreamAssignPass,
         TrainingFlopsPass, TrainingMemoryPass, TrainingPipelinePass,
     )
     from python.zrt.transform.training.zero_fsdp import ZeroFSDPPass
@@ -122,6 +122,11 @@ def build_pipeline(*, fusion: str = "v2") -> TransformPipeline:
     # written by the parallel passes above.
     pipe.add("split", CommInserterPass(),
              condition=lambda c: c.parallel.tp > 1 or c.parallel.ep > 1 or c.parallel.cp > 1)
+    # CoCTilePass splits CoC-annotated all_reduce nodes into tiled compute+comm
+    # pipelines. Must run after CommInserterPass (which creates the comm nodes)
+    # but before StreamAssignPass (which assigns stream_ids).
+    pipe.add("split", CoCTilePass(),
+             condition=lambda c: c.is_training and c.training.tp_coc)
     pipe.add("split", PipelineParallelPass(),
              condition=lambda c: c.parallel.pp > 1)
 
@@ -146,6 +151,8 @@ def build_pipeline(*, fusion: str = "v2") -> TransformPipeline:
     pipe.add("analyze", FlopsPass())
     pipe.add("analyze", RooflinePass())
     pipe.add("analyze", CommLatencyPass())
+    pipe.add("analyze", CoCLatencyPass(),
+             condition=lambda c: c.is_training and c.training.tp_coc)
     pipe.add("analyze", StreamAssignPass())
     pipe.add("analyze", TrainingFlopsPass(),    condition=is_train)
     pipe.add("analyze", TrainingMemoryPass(),   condition=is_train)

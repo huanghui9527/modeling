@@ -1,131 +1,104 @@
-"""Test OpGraph.from_model_spec() factory method."""
+"""Test OpGraph.from_model_spec() factory method.
+
+Phase 3: Updated to use build_opgraph() internally (no longer depends on old IR).
+"""
 
 import pytest
 
 from zrt.ir.graph import OpGraph
-from zrt.training.ir.builders import build_graph
 from zrt.training.spec.model import LayerKind, ModelSpec
 from zrt.training.spec.strategy import Strategy
 
 
-def test_opgraph_from_spec_matches_training_graph():
-    """OpGraph.from_model_spec() should produce nodes matching build_graph()."""
-    model = ModelSpec(
-        hidden=4096,
-        ffn=16384,
-        num_heads=32,
-        num_kv_heads=32,
-        head_dim=128,
-        vocab=32000,
-        seq_len=2048,
-        layers=[LayerKind.DENSE] * 4,
+def _make_model(num_layers=4, **kwargs) -> ModelSpec:
+    defaults = dict(
+        hidden=4096, ffn=16384, num_heads=32, num_kv_heads=32,
+        head_dim=128, vocab=32000, seq_len=2048,
+        layers=[LayerKind.DENSE] * num_layers,
     )
+    defaults.update(kwargs)
+    return ModelSpec(**defaults)
+
+
+def test_opgraph_from_spec_returns_opgraph():
+    """from_model_spec() should return a valid OpGraph with compute nodes."""
+    model = _make_model()
     strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1, global_batch=1)
 
-    # Old way: build training IR
-    from zrt.training.ir.training_graph import Graph as TrainingGraph
-    training_g: TrainingGraph = build_graph(model, strategy)
-
-    # New way: use OpGraph factory
     opgraph = OpGraph.from_model_spec(model, strategy)
 
-    # Verify node count matches
-    assert len(opgraph.nodes) == len(training_g.ops)
-
-    # Verify op types match
-    for op_node, training_op in zip(opgraph.nodes.values(), training_g.ops):
-        assert op_node.op_type == training_op.kind
+    assert isinstance(opgraph, OpGraph)
+    assert len(opgraph.nodes) > 0
+    compute_nodes = [n for n in opgraph.nodes.values() if n.category != "communication"]
+    assert len(compute_nodes) > 0
+    for node in compute_nodes:
+        assert node.op_type
 
 
 def test_opgraph_from_spec_metadata():
-    """OpGraph.from_model_spec() should set source metadata."""
-    model = ModelSpec(
-        hidden=4096,
-        ffn=16384,
-        num_heads=32,
-        num_kv_heads=32,
-        head_dim=128,
-        vocab=32000,
-        seq_len=2048,
-        layers=[LayerKind.DENSE] * 2,
-    )
+    """from_model_spec() should set source and model metadata."""
+    model = _make_model(num_layers=2)
     strategy = Strategy(tp=2, pp=1, dp=1, micro_batch=1, global_batch=1)
 
     opgraph = OpGraph.from_model_spec(model, strategy)
 
-    # Verify metadata
     assert opgraph.metadata["source"] == "model_spec"
     assert opgraph.metadata["hidden"] == model.hidden
-    assert opgraph.metadata["layers"] == len(model.layers)
+    assert opgraph.metadata["num_layers"] == len(model.layers)
     assert "strategy" in opgraph.metadata
-    assert "collectives" in opgraph.metadata
 
 
-def test_opgraph_from_spec_layer_annotations():
-    """Each OpNode should have layer_id and layer_kind annotations."""
-    model = ModelSpec(
-        hidden=2048,
-        ffn=8192,
-        num_heads=16,
-        num_kv_heads=16,
-        head_dim=128,
-        vocab=32000,
-        seq_len=1024,
+def test_opgraph_from_spec_layer_info():
+    """Compute nodes should have layer and layer_kind attributes."""
+    model = _make_model(
+        num_layers=2,
         layers=[LayerKind.DENSE, LayerKind.MOE],
-        num_experts=4,
-        moe_ffn=1024,
-        top_k=1,
+        num_experts=4, moe_ffn=1024, top_k=1,
     )
     strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1, global_batch=1)
 
     opgraph = OpGraph.from_model_spec(model, strategy)
 
-    # All nodes should have layer annotations
-    for node in opgraph.nodes.values():
-        assert "layer_id" in node.annotations
-        assert "layer_kind" in node.annotations
-        assert isinstance(node.annotations["layer_id"], int)
-        assert isinstance(node.annotations["layer_kind"], str)
+    compute_nodes = [n for n in opgraph.nodes.values() if n.category != "communication"]
+    layer_nodes = [n for n in compute_nodes if n.layer]
+    assert len(layer_nodes) > 0
+    for node in layer_nodes:
+        assert isinstance(node.layer, str)
+        assert "layer_kind" in node.attrs
 
 
-def test_opgraph_from_spec_edges_within_layers():
-    """Edges should only connect ops within the same layer."""
-    model = ModelSpec(
-        hidden=2048,
-        ffn=8192,
-        num_heads=16,
-        num_kv_heads=16,
-        head_dim=128,
-        vocab=32000,
-        seq_len=1024,
-        layers=[LayerKind.DENSE] * 3,
-    )
+def test_opgraph_from_spec_edges_exist():
+    """OpGraph should have data-flow edges between nodes."""
+    model = _make_model(num_layers=3)
     strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1, global_batch=1)
 
     opgraph = OpGraph.from_model_spec(model, strategy)
 
-    # Verify edges only connect nodes with same layer_id
+    assert len(opgraph.edges) > 0
     for edge in opgraph.edges:
-        src_layer = opgraph.nodes[edge.src].annotations.get("layer_id")
-        dst_layer = opgraph.nodes[edge.dst].annotations.get("layer_id")
-        assert src_layer == dst_layer
+        assert edge.src in opgraph.nodes
+        assert edge.dst in opgraph.nodes
 
 
 def test_opgraph_from_spec_phase_parameter():
     """Custom phase parameter should be reflected in the graph."""
-    model = ModelSpec(
-        hidden=2048,
-        ffn=8192,
-        num_heads=16,
-        num_kv_heads=16,
-        head_dim=128,
-        vocab=32000,
-        seq_len=1024,
-        layers=[LayerKind.DENSE],
-    )
+    model = _make_model(num_layers=1)
     strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1, global_batch=1)
 
     opgraph = OpGraph.from_model_spec(model, strategy, phase="inference")
 
     assert opgraph.phase == "inference"
     assert "inference" in opgraph.name
+
+
+def test_opgraph_from_spec_tp_produces_comm_nodes():
+    """TP > 1 should produce communication nodes."""
+    model = _make_model(num_layers=2)
+    strategy = Strategy(tp=2, pp=1, dp=1, micro_batch=1, global_batch=1)
+
+    opgraph = OpGraph.from_model_spec(model, strategy)
+
+    comm_nodes = [n for n in opgraph.nodes.values() if n.category == "communication"]
+    assert len(comm_nodes) > 0
+    for node in comm_nodes:
+        assert node.op_type.startswith("comm.")

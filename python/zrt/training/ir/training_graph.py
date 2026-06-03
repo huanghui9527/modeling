@@ -1,3 +1,20 @@
+"""Legacy training IR types — DEPRECATED.
+
+.. deprecated::
+    Use ``zrt.ir.graph.OpGraph`` / ``OpNode`` / ``Edge`` / ``TensorMeta`` instead.
+    This module is retained as a compatibility layer for downstream code
+    (``compose/schedules.py``, ``compose/stage.py``, ``models/flops.py``, etc.)
+    that has not yet been fully migrated.
+
+    New code should use:
+      - ``OpGraph`` instead of ``Graph``
+      - ``OpNode`` instead of ``Op``
+      - ``TensorMeta`` instead of ``Tensor``
+      - ``comm.*`` OpNodes instead of ``Collective``
+
+    Adapter: ``zrt.training.ir.graph_adapter.opgraph_to_graph()`` converts
+    the new IR back to this format for legacy consumers.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field

@@ -1,13 +1,26 @@
-"""IR block builders — construct per-layer op lists from ModelSpec geometry."""
+"""IR block builders — construct per-layer op lists from ModelSpec geometry.
+
+Entry points:
+  - :func:`build_graph` — legacy Graph path (returns Graph with Op/Tensor)
+  - :func:`build_opgraph_direct` — OpGraph-native path (returns OpGraph with OpNode/TensorMeta)
+"""
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from zrt.ir.graph import OpGraph
+    from zrt.ir.node import OpNode
+    from zrt.ir.types import TensorMeta
+
 from zrt.training.ir.training_graph import Graph, Op, Tensor
+from zrt.training.models.mega_moe import infer_quant_variant
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import LayerKind, ModelSpec
 from zrt.training.spec.strategy import Strategy
-from zrt.training.ir.cast_pass import insert_cast_pass
-from zrt.training.ir.shard import ShardPlan, insert_collectives
+from zrt.training.ir.cast_pass import insert_cast_pass, insert_cast_pass_opgraph
+from zrt.training.ir.shard import ShardPlan, insert_collectives, insert_collectives_opgraph
 
 
 def _tensor(name: str, shape: tuple[int, ...], dtype: Dtype,
@@ -50,15 +63,18 @@ def _mhc_pre_op(seq: int, hidden: int, hc_mult: int, sinkhorn_iters: int,
 def _mhc_post_op(seq: int, hidden: int, hc_mult: int, layer_id: int,
                  layer_kind: LayerKind, prefix: str, suffix: str,
                  act_dtype: Dtype) -> Op:
+    sub_name = "attn_proj" if suffix == "attn" else "ffn_out"
+    res_name = f"x_hc_{suffix}"
+    out_name = "x_hc_ffn" if suffix == "attn" else "x_hc_attn"
     return Op(
         name=f"{prefix}.mhc_post_{suffix}", kind="mhc_post",
         inputs=[
-            _tensor(f"x_sub_{suffix}", (seq, hidden), act_dtype),
-            _tensor(f"x_res_{suffix}", (seq, hc_mult, hidden), act_dtype),
+            _tensor(sub_name, (seq, hidden), act_dtype),
+            _tensor(res_name, (seq, hc_mult, hidden), act_dtype),
             _tensor(f"hc_post_{suffix}", (seq, hc_mult), Dtype.FP32),
             _tensor(f"hc_comb_{suffix}", (seq, hc_mult, hc_mult), Dtype.FP32),
         ],
-        outputs=[_tensor(f"x_hc_out_{suffix}", (seq, hc_mult, hidden), act_dtype)],
+        outputs=[_tensor(out_name, (seq, hc_mult, hidden), act_dtype)],
         meta={"b": 1, "s": seq, "h": hidden, "hc": hc_mult},
         layer_id=layer_id, layer_kind=layer_kind,
         component="norm",
@@ -98,8 +114,8 @@ def _build_standard_attn(model: ModelSpec, layer_id: int, seq: int,
            layer_id=layer_id, layer_kind=layer_kind, component="attention"),
 
         Op(name=f"{prefix}.rope", kind="rope",
-           inputs=[_tensor("q", (seq, h_attn), act_dtype),
-                   _tensor("k", (seq, h_kv), act_dtype)],
+           inputs=[_tensor("qkv", (seq, h_attn), act_dtype),
+                   _tensor("qkv", (seq, h_kv), act_dtype)],
            outputs=[_tensor("q_rope", (seq, h_attn), act_dtype),
                     _tensor("k_rope", (seq, h_kv), act_dtype)],
            meta={"bytes_fwd": seq * (h_attn + h_kv) * act_dtype.bytes * 2},
@@ -108,7 +124,7 @@ def _build_standard_attn(model: ModelSpec, layer_id: int, seq: int,
         Op(name=f"{prefix}.attn_core", kind="attn_core",
            inputs=[_tensor("q_rope", (seq, h_attn), act_dtype),
                    _tensor("k_rope", (seq, h_kv), act_dtype),
-                   _tensor("v", (seq, h_kv), act_dtype)],
+                   _tensor("qkv", (seq, h_kv), act_dtype)],
            outputs=[_tensor("attn_out", (seq, h_attn), act_dtype)],
            meta={"b": 1, "s": seq, "heads": model.num_heads,
                  "kv_heads": model.num_kv_heads,
@@ -169,7 +185,7 @@ def _build_mla_attn(model: ModelSpec, layer_id: int, seq: int,
 
     # kv_a_layernorm (only on the kv_lora_rank part, not rope part)
     ops.append(Op(name=f"{prefix}.kv_a_norm", kind=_norm_kind(model),
-        inputs=[_tensor("kv_a_latent", (seq, model.kv_lora_rank), act_dtype)],
+        inputs=[_tensor("kv_a", (seq, model.kv_lora_rank), act_dtype)],
         outputs=[_tensor("kv_a_normed", (seq, model.kv_lora_rank), act_dtype)],
         meta={"bytes_fwd": seq * model.kv_lora_rank * act_dtype.bytes * 2},
         layer_id=layer_id, layer_kind=layer_kind, component="attention"))
@@ -184,8 +200,8 @@ def _build_mla_attn(model: ModelSpec, layer_id: int, seq: int,
     # RoPE on rope dims of Q and K
     h_rope = n_h * qk_rope
     ops.append(Op(name=f"{prefix}.rope", kind="rope",
-        inputs=[_tensor("q_rope_part", (seq, h_rope), act_dtype),
-                _tensor("k_rope_part", (seq, qk_rope), act_dtype)],
+        inputs=[_tensor("q_full", (seq, h_rope), act_dtype),
+                _tensor("kv_a", (seq, qk_rope), act_dtype)],
         outputs=[_tensor("q_rope", (seq, h_rope), act_dtype),
                  _tensor("k_rope", (seq, qk_rope), act_dtype)],
         meta={"bytes_fwd": seq * (h_rope + qk_rope) * act_dtype.bytes * 2},
@@ -206,9 +222,9 @@ def _build_mla_attn(model: ModelSpec, layer_id: int, seq: int,
     if model.index_topk > 0 and not model.use_v4_attn:
         attn_meta["sparse_topk"] = model.index_topk
     ops.append(Op(name=f"{prefix}.attn_core", kind="attn_core",
-        inputs=[_tensor("q_final", (seq, h_q), act_dtype),
-                _tensor("k_final", (seq, n_h * qk_nope + qk_rope), act_dtype),
-                _tensor("v_final", (seq, n_h * v_hd), act_dtype)],
+        inputs=[_tensor("q_rope", (seq, h_q), act_dtype),
+                _tensor("k_rope", (seq, n_h * qk_nope + qk_rope), act_dtype),
+                _tensor("kv_full", (seq, n_h * v_hd), act_dtype)],
         outputs=[_tensor("attn_out", (seq, h_attn_out), act_dtype)],
         meta=attn_meta,
         layer_id=layer_id, layer_kind=layer_kind, component="attention"))
@@ -289,8 +305,8 @@ def _build_v4_attn(model: ModelSpec, layer_id: int, seq: int,
     # RoPE on rope dims
     rope_d = model.qk_rope_head_dim
     ops.append(Op(name=f"{prefix}.rope", kind="rope",
-        inputs=[_tensor("q_rope_part", (seq, model.num_heads * rope_d), act_dtype),
-                _tensor("k_rope_part", (seq, rope_d), act_dtype)],
+        inputs=[_tensor("q_norm2", (seq, model.num_heads * rope_d), act_dtype),
+                _tensor("kv_normed", (seq, rope_d), act_dtype)],
         outputs=[_tensor("q_rope", (seq, model.num_heads * rope_d), act_dtype),
                  _tensor("k_rope", (seq, rope_d), act_dtype)],
         meta={"bytes_fwd": seq * (model.num_heads * rope_d + rope_d) * act_dtype.bytes * 2},
@@ -317,9 +333,9 @@ def _build_v4_attn(model: ModelSpec, layer_id: int, seq: int,
         attn_kind = "attn_core"
 
     ops.append(Op(name=f"{prefix}.{attn_kind}", kind=attn_kind,
-        inputs=[_tensor("q_final", (seq, h_attn), act_dtype),
-                _tensor("k_all", (seq, d), act_dtype),
-                _tensor("v_all", (seq, d), act_dtype)],
+        inputs=[_tensor("q_rope", (seq, h_attn), act_dtype),
+                _tensor("k_rope", (seq, d), act_dtype),
+                _tensor("kv_normed", (seq, d), act_dtype)],
         outputs=[_tensor("attn_out", (seq, h_attn), act_dtype)],
         meta=attn_meta,
         layer_id=layer_id, layer_kind=layer_kind, component="attention"))
@@ -450,7 +466,7 @@ def _build_indexer_ops(model: ModelSpec, layer_id: int, seq: int,
 
 def _build_moe_ffn_ops(model: ModelSpec, layer_id: int, seq: int,
                        prefix: str, layer_kind: LayerKind,
-                       act_dtype: Dtype) -> list[Op]:
+                       act_dtype: Dtype, strategy: Strategy) -> list[Op]:
     """MoE FFN: router + shared expert + routed experts + aggregation."""
     h = model.hidden
     ops: list[Op] = []
@@ -512,28 +528,55 @@ def _build_moe_ffn_ops(model: ModelSpec, layer_id: int, seq: int,
             layer_id=layer_id, layer_kind=layer_kind, component="shared_expert"))
 
     # Routed expert FFN (single op with fwd_multiplier)
-    ops.append(Op(name=f"{prefix}.routed_expert_ffn", kind="matmul",
-        inputs=[_tensor("x_ln2", (seq, h), act_dtype)],
-        outputs=[_tensor("routed_ffn_out", (seq, h), act_dtype)],
-        meta={"m": seq, "n": h, "k": model.moe_ffn,
-              "fwd_multiplier": 3 * model.top_k,
-              "swiglu_clamp": model.swiglu_clamp,
-              "fused_weight_dims": True},
-        layer_id=layer_id, layer_kind=layer_kind, component="routed_expert"))
+    routed_ffn_out_dtype = act_dtype
+    if strategy.mega_moe:
+        moe_act_dtype = model.effective_moe_act_dtype()
+        ops.append(Op(name=f"{prefix}.mega_moe", kind="mega_moe",
+            inputs=[_tensor("x_ln2", (seq, h), act_dtype)],
+            outputs=[_tensor("routed_ffn_out", (seq, h), act_dtype)],
+            meta={"m": seq, "n": h, "k": model.moe_ffn,
+                  "micro_batch": strategy.micro_batch,
+                  "num_experts": model.num_experts,
+                  "top_k": model.top_k,
+                  "requested_waves": strategy.mega_moe_waves,
+                  "act_bytes": act_dtype.bytes,
+                  "out_bytes": act_dtype.bytes,
+                  "moe_act_bytes": moe_act_dtype.bytes,
+                  "moe_act_dtype": moe_act_dtype,
+                  "weight_bytes": model.routed_expert_compute_dtype.bytes,
+                  "weight_stored_bytes": model.routed_expert_weight_dtype.stored_bytes,
+                  "quant_variant": infer_quant_variant(model),
+                  "fwd_multiplier": 3 * model.top_k,
+                  "swiglu_clamp": model.swiglu_clamp,
+                  "fused_dispatch_compute_combine": True},
+            layer_id=layer_id, layer_kind=layer_kind, component="routed_expert"))
+    else:
+        ops.append(Op(name=f"{prefix}.routed_expert_ffn", kind="matmul",
+            inputs=[_tensor("x_ln2", (seq, h), act_dtype)],
+            outputs=[_tensor("routed_ffn_out", (seq, h), act_dtype)],
+            meta={"m": seq, "n": h, "k": model.moe_ffn,
+                  "fwd_multiplier": 3 * model.top_k,
+                  "swiglu_clamp": model.swiglu_clamp,
+                  "fused_weight_dims": True},
+            layer_id=layer_id, layer_kind=layer_kind, component="routed_expert"))
 
     # Expert aggregation
     if model.n_shared_experts > 0:
         ops.append(Op(name=f"{prefix}.expert_agg", kind="add",
             inputs=[_tensor("shared_ffn_out", (seq, h), act_dtype),
-                    _tensor("routed_ffn_out", (seq, h), act_dtype)],
+                    _tensor("routed_ffn_out", (seq, h), routed_ffn_out_dtype)],
             outputs=[_tensor("ffn_out", (seq, h), act_dtype)],
-            meta={"bytes_fwd": seq * h * act_dtype.bytes * 3},
+            meta={"bytes_fwd": seq * h * (
+                act_dtype.bytes + routed_ffn_out_dtype.bytes + act_dtype.bytes
+            )},
             layer_id=layer_id, layer_kind=layer_kind, component="routed_expert"))
     else:
         ops.append(Op(name=f"{prefix}.expert_agg", kind="add",
-            inputs=[_tensor("routed_ffn_out", (seq, h), act_dtype)],
+            inputs=[_tensor("routed_ffn_out", (seq, h), routed_ffn_out_dtype)],
             outputs=[_tensor("ffn_out", (seq, h), act_dtype)],
-            meta={"bytes_fwd": seq * h * act_dtype.bytes * 2},
+            meta={"bytes_fwd": seq * h * (
+                routed_ffn_out_dtype.bytes + act_dtype.bytes
+            )},
             layer_id=layer_id, layer_kind=layer_kind, component="routed_expert"))
 
     return ops
@@ -606,8 +649,8 @@ def dense_block(
                layer_id=layer_id, layer_kind=LayerKind.DENSE,
                component="attention"),
             Op(name=f"{prefix}.rope", kind="rope",
-               inputs=[_tensor("q", (seq, h_attn), act_dtype),
-                       _tensor("k", (seq, h_kv), act_dtype)],
+               inputs=[_tensor("qkv", (seq, h_attn), act_dtype),
+                       _tensor("qkv", (seq, h_kv), act_dtype)],
                outputs=[_tensor("q_rope", (seq, h_attn), act_dtype),
                         _tensor("k_rope", (seq, h_kv), act_dtype)],
                meta={"bytes_fwd": seq * (h_attn + h_kv) * act_dtype.bytes * 2},
@@ -616,7 +659,7 @@ def dense_block(
             Op(name=f"{prefix}.attn_core", kind="attn_core",
                inputs=[_tensor("q_rope", (seq, h_attn), act_dtype),
                        _tensor("k_rope", (seq, h_kv), act_dtype),
-                       _tensor("v", (seq, h_kv), act_dtype)],
+                       _tensor("qkv", (seq, h_kv), act_dtype)],
                outputs=[_tensor("attn_out", (seq, h_attn), act_dtype)],
                meta={"b": 1, "s": seq, "heads": num_heads,
                      "kv_heads": num_kv_heads,
@@ -707,7 +750,7 @@ def dense_block(
             name=f"{prefix}.residual2", kind="add",
             inputs=[_tensor("ffn_out", (seq, h), act_dtype),
                     _tensor("x_attn", (seq, h), act_dtype)],
-            outputs=[_tensor("y", (seq, h), act_dtype)],
+            outputs=[_tensor("x", (seq, h), act_dtype)],
             meta={"bytes_fwd": seq * h * act_dtype.bytes * 3},
             layer_id=layer_id, layer_kind=LayerKind.DENSE,
         ))
@@ -731,6 +774,7 @@ def _moe_block(
     hc_mult: int = 1,
     hc_sinkhorn_iters: int = 20,
     model: ModelSpec | None = None,
+    strategy: Strategy | None = None,
 ) -> list[Op]:
     """Build ops for one MoE transformer block."""
     use_hc = hc_mult > 1
@@ -782,8 +826,8 @@ def _moe_block(
                layer_id=layer_id, layer_kind=LayerKind.MOE,
                component="attention"),
             Op(name=f"{prefix}.rope", kind="rope",
-               inputs=[_tensor("q", (seq, h_attn), act_dtype),
-                       _tensor("k", (seq, h_kv), act_dtype)],
+               inputs=[_tensor("qkv", (seq, h_attn), act_dtype),
+                       _tensor("qkv", (seq, h_kv), act_dtype)],
                outputs=[_tensor("q_rope", (seq, h_attn), act_dtype),
                         _tensor("k_rope", (seq, h_kv), act_dtype)],
                meta={"bytes_fwd": seq * (h_attn + h_kv) * act_dtype.bytes * 2},
@@ -792,7 +836,7 @@ def _moe_block(
             Op(name=f"{prefix}.attn_core", kind="attn_core",
                inputs=[_tensor("q_rope", (seq, h_attn), act_dtype),
                        _tensor("k_rope", (seq, h_kv), act_dtype),
-                       _tensor("v", (seq, h_kv), act_dtype)],
+                       _tensor("qkv", (seq, h_kv), act_dtype)],
                outputs=[_tensor("attn_out", (seq, h_attn), act_dtype)],
                meta={"b": 1, "s": seq, "heads": num_heads,
                      "kv_heads": num_kv_heads,
@@ -845,7 +889,8 @@ def _moe_block(
     # ── MoE FFN ────────────────────────────────────────────────────────
     if model is not None:
         ops.extend(_build_moe_ffn_ops(model, layer_id, seq, prefix,
-                                       LayerKind.MOE, moe_act))
+                                       LayerKind.MOE, moe_act,
+                                       strategy or Strategy()))
     else:
         # Legacy path
         ops.append(Op(
@@ -943,7 +988,7 @@ def _moe_block(
             name=f"{prefix}.residual2", kind="add",
             inputs=[_tensor("ffn_out", (seq, h), moe_act),
                     _tensor("x_attn", (seq, h), act_dtype)],
-            outputs=[_tensor("y", (seq, h), act_dtype)],
+            outputs=[_tensor("x", (seq, h), act_dtype)],
             meta={"bytes_fwd": seq * h * (moe_act.bytes + 2 * act_dtype.bytes)},
             layer_id=layer_id, layer_kind=LayerKind.MOE,
         ))
@@ -963,18 +1008,31 @@ def _mtp_block(
     hc_mult: int = 1,
     hc_sinkhorn_iters: int = 20,
     model: ModelSpec | None = None,
+    strategy: Strategy | None = None,
 ) -> list[Op]:
     """Build ops for one MTP block: embedding projection + transformer block."""
     prefix = f"L{layer_id}"
     h = hidden
+    use_hc = hc_mult > 1
 
-    embed_proj = Op(
-        name=f"{prefix}.mtp_embed_proj", kind="matmul",
-        inputs=[_tensor("x_mtp_in", (seq, h), act_dtype)],
-        outputs=[_tensor("x_proj", (seq, h), act_dtype)],
-        meta={"m": seq, "n": h, "k": h},
-        layer_id=layer_id, layer_kind=LayerKind.MTP,
-    )
+    # MTP embed projection connects to previous layer's output
+    # When HC is enabled, previous layer outputs x_hc_attn; otherwise x
+    if use_hc:
+        embed_proj = Op(
+            name=f"{prefix}.mtp_embed_proj", kind="matmul",
+            inputs=[_tensor("x_hc_attn", (seq, hc_mult, h), act_dtype)],
+            outputs=[_tensor("x_hc_attn", (seq, hc_mult, h), act_dtype)],
+            meta={"m": seq * hc_mult, "n": h, "k": h},
+            layer_id=layer_id, layer_kind=LayerKind.MTP,
+        )
+    else:
+        embed_proj = Op(
+            name=f"{prefix}.mtp_embed_proj", kind="matmul",
+            inputs=[_tensor("x", (seq, h), act_dtype)],
+            outputs=[_tensor("x", (seq, h), act_dtype)],
+            meta={"m": seq, "n": h, "k": h},
+            layer_id=layer_id, layer_kind=LayerKind.MTP,
+        )
 
     # MTP uses MoE block if any MoE layers exist, else dense
     if model is not None and any(lk == LayerKind.MOE for lk in model.layers):
@@ -985,7 +1043,7 @@ def _mtp_block(
             seq=seq, num_heads=num_heads, num_kv_heads=num_kv_heads,
             head_dim=head_dim, layer_id=layer_id, act_dtype=act_dtype,
             hc_mult=hc_mult, hc_sinkhorn_iters=hc_sinkhorn_iters,
-            model=model,
+            model=model, strategy=strategy,
         )
     else:
         block_ops = dense_block(
@@ -1005,7 +1063,7 @@ def _embed_op(vocab: int, hidden: int, seq: int, act_dtype: Dtype) -> Op:
     return Op(
         name="embed", kind="embed",
         inputs=[_tensor("input_ids", (seq,), act_dtype)],
-        outputs=[_tensor("x_embed", (seq, hidden), act_dtype)],
+        outputs=[_tensor("x", (seq, hidden), act_dtype)],
         meta={"m": seq, "n": hidden, "k": vocab},
         layer_id=-1, layer_kind=LayerKind.DENSE,
         component="embedding",
@@ -1026,8 +1084,8 @@ def _lm_head_op(vocab: int, hidden: int, seq: int, act_dtype: Dtype) -> Op:
 def _hc_expand_op(seq: int, hidden: int, hc_mult: int, act_dtype: Dtype) -> Op:
     return Op(
         name="hc_expand", kind="hc_expand",
-        inputs=[_tensor("x_embed", (seq, hidden), act_dtype)],
-        outputs=[_tensor("x_hc_init", (seq, hc_mult, hidden), act_dtype)],
+        inputs=[_tensor("x", (seq, hidden), act_dtype)],
+        outputs=[_tensor("x_hc_attn", (seq, hc_mult, hidden), act_dtype)],
         meta={"b": 1, "s": seq, "h": hidden, "hc": hc_mult,
               "bytes_fwd": seq * hidden * hc_mult * act_dtype.bytes},
         layer_id=-1, layer_kind=LayerKind.DENSE,
@@ -1037,8 +1095,8 @@ def _hc_expand_op(seq: int, hidden: int, hc_mult: int, act_dtype: Dtype) -> Op:
 def _mhc_head_op(seq: int, hidden: int, hc_mult: int, act_dtype: Dtype) -> Op:
     return Op(
         name="mhc_head", kind="mhc_head",
-        inputs=[_tensor("x_hc_final", (seq, hc_mult, hidden), act_dtype)],
-        outputs=[_tensor("x_collapsed", (seq, hidden), act_dtype)],
+        inputs=[_tensor("x_hc_attn", (seq, hc_mult, hidden), act_dtype)],
+        outputs=[_tensor("x", (seq, hidden), act_dtype)],
         meta={"b": 1, "s": seq, "h": hidden, "hc": hc_mult, "mix_hc": hc_mult},
         layer_id=-1, layer_kind=LayerKind.DENSE,
     )
@@ -1047,7 +1105,7 @@ def _mhc_head_op(seq: int, hidden: int, hc_mult: int, act_dtype: Dtype) -> Op:
 def _final_ln_op(model: ModelSpec, hidden: int, seq: int, act_dtype: Dtype) -> Op:
     return Op(
         name="final_ln", kind=_norm_kind(model),
-        inputs=[_tensor("x_final_raw", (seq, hidden), act_dtype)],
+        inputs=[_tensor("x", (seq, hidden), act_dtype)],
         outputs=[_tensor("x_final", (seq, hidden), act_dtype)],
         meta={"bytes_fwd": seq * hidden * act_dtype.bytes * 2},
         layer_id=-1, layer_kind=LayerKind.DENSE,
@@ -1093,7 +1151,7 @@ def build_graph(model: ModelSpec, strategy: Strategy) -> Graph:
                 seq=s, num_heads=model.num_heads, num_kv_heads=model.num_kv_heads,
                 head_dim=model.head_dim, layer_id=i, act_dtype=act_dtype,
                 hc_mult=hc_mult, hc_sinkhorn_iters=hc_iters,
-                model=model,
+                model=model, strategy=strategy,
             )
         elif lk == LayerKind.MTP:
             block_ops = _mtp_block(
@@ -1101,7 +1159,7 @@ def build_graph(model: ModelSpec, strategy: Strategy) -> Graph:
                 num_heads=model.num_heads, num_kv_heads=model.num_kv_heads,
                 head_dim=model.head_dim, layer_id=i, act_dtype=act_dtype,
                 hc_mult=hc_mult, hc_sinkhorn_iters=hc_iters,
-                model=model,
+                model=model, strategy=strategy,
             )
         else:
             raise ValueError(f"Unknown LayerKind: {lk}")
@@ -1130,3 +1188,309 @@ def build_graph(model: ModelSpec, strategy: Strategy) -> Graph:
     insert_collectives(graph, model, strategy)
 
     return graph
+
+
+# ── OpGraph-native builder (Phase B2) ──────────────────────────────────────
+
+def build_opgraph_direct(model: ModelSpec, strategy: Strategy) -> "OpGraph":
+    """Build OpGraph directly from ModelSpec + Strategy (Phase B2).
+
+    This is the OpGraph-native version of :func:`build_graph`. It produces
+    OpNode/TensorMeta objects directly, bypassing the legacy Graph/Op/Tensor
+    intermediate representation.
+
+    Parameters
+    ----------
+    model : ModelSpec
+        Model architecture specification.
+    strategy : Strategy
+        Parallel strategy configuration.
+
+    Returns
+    -------
+    OpGraph
+        Raw computation graph with sharding and collectives applied.
+    """
+    from zrt.ir.graph import OpGraph
+    from zrt.ir.node import OpNode, infer_category
+    from zrt.ir.types import TensorMeta, DType
+    from zrt.ir.edge import Edge
+
+    h = model.hidden
+    s = model.seq_len
+    act_dtype = model.act_dtype
+
+    hc_mult = max(1, model.hc_mult)
+    hc_iters = model.hc_sinkhorn_iters
+
+    slug = _model_slug(model)
+    graph = OpGraph(
+        name=f"{slug}_train",
+        phase="train_forward",
+        metadata={
+            "model_name": slug,
+            "seq_len": model.seq_len,
+            "hidden": model.hidden,
+            "num_layers": len(model.layers),
+            "num_layers_traced": len(model.layers),
+            "batch_size": strategy.micro_batch,
+            "total_params": model.total_params(),
+            "param_dtype_bytes": model.param_dtype.bytes,
+        },
+    )
+
+    tensor_producer: dict[str, tuple[str, int]] = {}
+
+    def _prod_key(tensor_id: str, layer: str) -> str:
+        if layer and layer != "-1":
+            return f"{layer}:{tensor_id}"
+        return tensor_id
+
+    def _add_node(node: OpNode) -> None:
+        graph.add_node(node)
+        if node.op_type.startswith("comm."):
+            return
+        for dst_idx, t_in in enumerate(node.inputs):
+            layer_key = _prod_key(t_in.id, node.layer)
+            producer = tensor_producer.get(layer_key) or tensor_producer.get(t_in.id)
+            if producer is None:
+                continue
+            src_id, src_idx = producer
+            if src_id == node.id:
+                continue
+            src_node = graph.nodes.get(src_id)
+            tensor_meta = None
+            if src_node and src_idx < len(src_node.outputs):
+                tensor_meta = src_node.outputs[src_idx]
+            graph.add_edge(Edge(
+                src=src_id,
+                src_idx=src_idx,
+                dst=node.id,
+                dst_idx=dst_idx,
+                tensor=tensor_meta,
+            ))
+        for slot, t_out in enumerate(node.outputs):
+            key = _prod_key(t_out.id, node.layer)
+            tensor_producer[key] = (node.id, slot)
+            tensor_producer[t_out.id] = (node.id, slot)
+
+    embed_node = _embed_opnode(model.vocab, h, s, act_dtype)
+    _add_node(embed_node)
+
+    if hc_mult > 1:
+        hc_node = _hc_expand_opnode(s, h, hc_mult, act_dtype)
+        _add_node(hc_node)
+
+    for i, lk in enumerate(model.layers):
+        if lk == LayerKind.DENSE:
+            block_nodes = dense_block_opnode(
+                hidden=h, ffn=model.ffn, seq=s,
+                num_heads=model.num_heads, num_kv_heads=model.num_kv_heads,
+                head_dim=model.head_dim, layer_id=i, act_dtype=act_dtype,
+                hc_mult=hc_mult, hc_sinkhorn_iters=hc_iters,
+                model=model,
+            )
+        elif lk == LayerKind.MOE:
+            block_nodes = _moe_block_opnode(
+                hidden=h, ffn=model.ffn, moe_ffn=model.moe_ffn,
+                num_experts=model.num_experts, top_k=model.top_k,
+                n_shared_experts=model.n_shared_experts,
+                seq=s, num_heads=model.num_heads, num_kv_heads=model.num_kv_heads,
+                head_dim=model.head_dim, layer_id=i, act_dtype=act_dtype,
+                hc_mult=hc_mult, hc_sinkhorn_iters=hc_iters,
+                model=model,
+            )
+        elif lk == LayerKind.MTP:
+            block_nodes = _mtp_block_opnode(
+                hidden=h, ffn=model.ffn, seq=s,
+                num_heads=model.num_heads, num_kv_heads=model.num_kv_heads,
+                head_dim=model.head_dim, layer_id=i, act_dtype=act_dtype,
+                hc_mult=hc_mult, hc_sinkhorn_iters=hc_iters,
+                model=model,
+            )
+        else:
+            raise ValueError(f"Unknown LayerKind: {lk}")
+
+        for node in block_nodes:
+            _add_node(node)
+
+    if hc_mult > 1:
+        mhc_head_node = _mhc_head_opnode(s, h, hc_mult, act_dtype)
+        _add_node(mhc_head_node)
+
+    final_ln_node = _final_ln_opnode(model, h, s, act_dtype)
+    _add_node(final_ln_node)
+
+    lm_head_node = _lm_head_opnode(model.vocab, h, s, act_dtype)
+    _add_node(lm_head_node)
+
+    insert_cast_pass_opgraph(graph, model, getattr(strategy, "quant", None))
+    insert_collectives_opgraph(graph, model, strategy)
+
+    return graph
+
+
+def _model_slug(model: ModelSpec) -> str:
+    """Derive a short slug from ModelSpec for graph naming."""
+    n_dense = sum(1 for lk in model.layers if lk.value == "dense")
+    n_moe = sum(1 for lk in model.layers if lk.value == "moe")
+    parts = [f"h{model.hidden}"]
+    if n_dense:
+        parts.append(f"d{n_dense}")
+    if n_moe:
+        parts.append(f"moe{n_moe}")
+    return "_".join(parts)
+
+
+def _tensor_meta(name: str, shape: tuple[int, ...], dtype: Dtype,
+                 is_activation: bool = True, is_param: bool = False) -> "TensorMeta":
+    """Create a TensorMeta from shape and dtype."""
+    from zrt.ir.types import TensorMeta
+    return TensorMeta.from_shape_dtype(name, shape, dtype)
+
+
+def _op_to_opnode(op: Op) -> "OpNode":
+    """Convert a legacy Op to an OpNode."""
+    from zrt.ir.node import OpNode, infer_category
+    from zrt.ir.types import TensorMeta
+
+    _KIND_TO_ATEN_OP = {
+        "matmul": "aten.mm.default",
+        "attn_core": "aten.scaled_dot_product_attention.default",
+        "sparse_attn": "aten.scaled_dot_product_attention.default",
+        "hca_attn": "aten.scaled_dot_product_attention.default",
+        "swa_attn": "aten.scaled_dot_product_attention.default",
+        "rmsnorm": "aten.rms_norm.default",
+        "ln": "aten.native_layer_norm.default",
+        "rope": "aten.rope.default",
+        "swiglu": "aten.silu.default",
+        "add": "aten.add.Tensor",
+        "softmax": "aten._softmax.default",
+        "embed": "aten.embedding.default",
+        "lm_head": "aten.mm.default",
+        "hash_route": "spec.hash_route",
+        "compressor_pool": "spec.compressor_pool",
+        "indexer_topk": "spec.indexer_topk",
+        "mhc_pre": "spec.mhc_pre",
+        "mhc_post": "spec.mhc_post",
+        "mhc_head": "spec.mhc_head",
+        "hc_expand": "spec.hc_expand",
+        "cast": "spec.cast",
+    }
+
+    op_type = _KIND_TO_ATEN_OP.get(op.kind, f"spec.{op.kind}")
+
+    inputs = []
+    for slot, t in enumerate(op.inputs):
+        shape = t.shape_local if t.shape_local else t.shape_logical
+        inputs.append(TensorMeta.from_shape_dtype(t.name, shape, t.dtype))
+
+    outputs = []
+    for slot, t in enumerate(op.outputs):
+        shape = t.shape_local if t.shape_local else t.shape_logical
+        outputs.append(TensorMeta.from_shape_dtype(t.name, shape, t.dtype))
+
+    attrs = dict(op.meta)
+    attrs["layer_kind"] = op.layer_kind.value if hasattr(op.layer_kind, "value") else str(op.layer_kind)
+    attrs["source"] = "model_spec"
+    attrs["spec_kind"] = op.kind
+
+    return OpNode(
+        id=op.name,
+        op_type=op_type,
+        inputs=inputs,
+        outputs=outputs,
+        attrs=attrs,
+        scope=op.name,
+        category=infer_category(op_type, op.component or ""),
+        layer=str(op.layer_id),
+        component=op.component or "",
+        name=op.name.rsplit(".", 1)[-1] if "." in op.name else op.name,
+    )
+
+
+def _embed_opnode(vocab: int, hidden: int, seq: int, act_dtype: Dtype) -> "OpNode":
+    """Create embed OpNode."""
+    op = _embed_op(vocab, hidden, seq, act_dtype)
+    return _op_to_opnode(op)
+
+
+def _hc_expand_opnode(seq: int, hidden: int, hc_mult: int, act_dtype: Dtype) -> "OpNode":
+    """Create hc_expand OpNode."""
+    op = _hc_expand_op(seq, hidden, hc_mult, act_dtype)
+    return _op_to_opnode(op)
+
+
+def _mhc_head_opnode(seq: int, hidden: int, hc_mult: int, act_dtype: Dtype) -> "OpNode":
+    """Create mhc_head OpNode."""
+    op = _mhc_head_op(seq, hidden, hc_mult, act_dtype)
+    return _op_to_opnode(op)
+
+
+def _final_ln_opnode(model: ModelSpec, hidden: int, seq: int, act_dtype: Dtype) -> "OpNode":
+    """Create final_ln OpNode."""
+    op = _final_ln_op(model, hidden, seq, act_dtype)
+    return _op_to_opnode(op)
+
+
+def _lm_head_opnode(vocab: int, hidden: int, seq: int, act_dtype: Dtype) -> "OpNode":
+    """Create lm_head OpNode."""
+    op = _lm_head_op(vocab, hidden, seq, act_dtype)
+    return _op_to_opnode(op)
+
+
+def dense_block_opnode(
+    hidden: int, ffn: int, seq: int,
+    num_heads: int, num_kv_heads: int, head_dim: int,
+    layer_id: int, act_dtype: Dtype = Dtype.BF16,
+    hc_mult: int = 1, hc_sinkhorn_iters: int = 20,
+    model: ModelSpec | None = None,
+) -> list["OpNode"]:
+    """Build OpNodes for one dense transformer block."""
+    ops = dense_block(
+        hidden=hidden, ffn=ffn, seq=seq,
+        num_heads=num_heads, num_kv_heads=num_kv_heads,
+        head_dim=head_dim, layer_id=layer_id, act_dtype=act_dtype,
+        hc_mult=hc_mult, hc_sinkhorn_iters=hc_sinkhorn_iters,
+        model=model,
+    )
+    return [_op_to_opnode(op) for op in ops]
+
+
+def _moe_block_opnode(
+    hidden: int, ffn: int, moe_ffn: int,
+    num_experts: int, top_k: int, n_shared_experts: int,
+    seq: int, num_heads: int, num_kv_heads: int, head_dim: int,
+    layer_id: int, act_dtype: Dtype = Dtype.BF16,
+    hc_mult: int = 1, hc_sinkhorn_iters: int = 20,
+    model: ModelSpec | None = None,
+) -> list["OpNode"]:
+    """Build OpNodes for one MoE transformer block."""
+    ops = _moe_block(
+        hidden=hidden, ffn=ffn, moe_ffn=moe_ffn,
+        num_experts=num_experts, top_k=top_k,
+        n_shared_experts=n_shared_experts,
+        seq=seq, num_heads=num_heads, num_kv_heads=num_kv_heads,
+        head_dim=head_dim, layer_id=layer_id, act_dtype=act_dtype,
+        hc_mult=hc_mult, hc_sinkhorn_iters=hc_sinkhorn_iters,
+        model=model,
+    )
+    return [_op_to_opnode(op) for op in ops]
+
+
+def _mtp_block_opnode(
+    hidden: int, ffn: int, seq: int,
+    num_heads: int, num_kv_heads: int, head_dim: int,
+    layer_id: int, act_dtype: Dtype = Dtype.BF16,
+    hc_mult: int = 1, hc_sinkhorn_iters: int = 20,
+    model: ModelSpec | None = None,
+) -> list["OpNode"]:
+    """Build OpNodes for one MTP block."""
+    ops = _mtp_block(
+        hidden=hidden, ffn=ffn, seq=seq,
+        num_heads=num_heads, num_kv_heads=num_kv_heads,
+        head_dim=head_dim, layer_id=layer_id, act_dtype=act_dtype,
+        hc_mult=hc_mult, hc_sinkhorn_iters=hc_sinkhorn_iters,
+        model=model,
+    )
+    return [_op_to_opnode(op) for op in ops]

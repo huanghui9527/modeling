@@ -49,6 +49,7 @@ def _normalize_recompute_categories(layer_kind: str, raw) -> set[str]:
             )
     return out
 
+from zrt.training.spec.capture_config import CaptureConfig
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import LayerKind, ModelSpec
 from zrt.training.spec.strategy import (
@@ -60,27 +61,34 @@ from zrt.training.spec.system import GPU, SystemSpec
 _MODELS_DIR = Path(__file__).parent.parent / "configs" / "models"
 
 
-def load_specs(config_path: str | Path) -> tuple[ModelSpec, SystemSpec, Strategy]:
-    """Load model + system + strategy from a single YAML file."""
+def load_specs(config_path: str | Path) -> tuple[ModelSpec, SystemSpec, Strategy, CaptureConfig | None]:
+    """Load model + system + strategy + optional capture config from a single YAML file.
+
+    Returns
+    -------
+    (ModelSpec, SystemSpec, Strategy, CaptureConfig | None)
+        The fourth element is None when the YAML has no ``capture:`` section.
+    """
     with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     model = _resolve_model(cfg["model"])
     system = _parse_system(cfg["system"])
     strategy = _parse_strategy(cfg["strategy"])
+    capture = _parse_capture(cfg.get("capture"))
 
-    return model, system, strategy
+    return model, system, strategy, capture
 
 
-def load_anchor_config(yaml_path: str | Path) -> tuple[ModelSpec, SystemSpec, Strategy]:
-    """Load anchor YAML into ModelSpec, SystemSpec, Strategy.
+def load_anchor_config(yaml_path: str | Path) -> tuple[ModelSpec, SystemSpec, Strategy, CaptureConfig | None]:
+    """Load anchor YAML into ModelSpec, SystemSpec, Strategy, CaptureConfig.
 
     Anchor YAMLs have a special structure:
       - model: reference to model config (e.g., "deepseek-v3") or inline model spec
       - system: hardware configuration (hw, nodes, gpus_per_node)
       - config: parallel strategy (tp, cp, pp, ep, dp, etc.)
 
-    Returns (ModelSpec, SystemSpec, Strategy) tuple for use with estimate().
+    Returns (ModelSpec, SystemSpec, Strategy, CaptureConfig | None) tuple for use with estimate().
     """
     with open(yaml_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -112,7 +120,9 @@ def load_anchor_config(yaml_path: str | Path) -> tuple[ModelSpec, SystemSpec, St
         raise ValueError(f"Anchor {yaml_path}: missing 'config' section")
     strategy = _parse_strategy(config_d)
 
-    return model, system, strategy
+    capture = _parse_capture(cfg.get("capture"))
+
+    return model, system, strategy, capture
 
 
 def _resolve_model(model_ref: str | dict) -> ModelSpec:
@@ -315,6 +325,8 @@ def _parse_strategy(d: dict) -> Strategy:
         offload=offload,
         tp_overlap=TPOverlap(d.get("tp_overlap", "none")),
         ep_overlap=d.get("ep_overlap", False),
+        mega_moe=d.get("mega_moe", False),
+        mega_moe_waves=int(d.get("mega_moe_waves", 0)),
         pp_overlap=d.get("pp_overlap", False),
         dualbatch=d.get("dualbatch", False),
         dp_overlap_in_bubble=d.get("dp_overlap_in_bubble", True),
@@ -323,6 +335,24 @@ def _parse_strategy(d: dict) -> Strategy:
         optimizer=OptKind(d.get("optimizer", "adam")),
         muon_config=muon_config,
         quant=quant,
+    )
+
+
+def _parse_capture(d: dict | None) -> CaptureConfig | None:
+    """Parse optional ``capture:`` section from YAML.
+
+    Returns None when the section is absent or empty.
+    """
+    if not d:
+        return None
+    return CaptureConfig(
+        model_id=d["model_id"],
+        num_layers=d.get("num_layers", 4),
+        seq_len=d.get("seq_len", 128),
+        batch_size=d.get("batch_size", 1),
+        target_layers=d.get("target_layers"),
+        gradient_checkpointing=d.get("gradient_checkpointing", False),
+        graph_mode=d.get("graph_mode", False),
     )
 
 

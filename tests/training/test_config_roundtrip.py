@@ -47,7 +47,7 @@ def test_config_loading():
     if not config_path.exists():
         pytest.skip("Config file not found")
 
-    model, system, strategy = load_specs(config_path)
+    model, system, strategy, _capture = load_specs(config_path)
 
     assert model.hidden == 8192
     assert model.num_heads == 64
@@ -64,7 +64,7 @@ def test_estimate_and_report():
     if not config_path.exists():
         pytest.skip("Config file not found")
 
-    model, system, strategy = load_specs(config_path)
+    model, system, strategy, _capture = load_specs(config_path)
     report = estimate(model, system, strategy)
 
     assert report.step_time_ms > 0

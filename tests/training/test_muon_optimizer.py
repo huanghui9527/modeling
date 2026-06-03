@@ -640,7 +640,7 @@ class TestMuonNSPeakBuffer:
     def test_muon_ns_buffer_zero_when_dp1(self):
         """No AllGather spike when DP=1 — no ZeRO sharding."""
         from zrt.training.models.memory import _muon_ns_peak_buffer
-        from zrt.training.ir.builders import build_graph
+        from zrt.training.ir.opgraph_builder import build_opgraph
 
         model = _make_mock_model()
         strategy = Strategy(tp=4, pp=4, dp=1, zero_stage=0,
@@ -668,7 +668,7 @@ class TestMuonNSPeakBuffer:
         """Muon peak_optimizer > Adam peak_optimizer when ZeRO sharding
         makes opt_state small but NS buffer adds a large transient spike."""
         from zrt.training.models.memory import memory_breakdown
-        from zrt.training.ir.builders import build_graph
+        from zrt.training.ir.opgraph_builder import build_opgraph
 
         model = _make_mock_model()
         system = _make_mock_system()
@@ -678,8 +678,8 @@ class TestMuonNSPeakBuffer:
         strategy_a = Strategy(tp=4, pp=4, dp=64, micro_batch=1, zero_stage=2,
                               optimizer=OptKind.ADAM)
 
-        graph_m = build_graph(model, strategy_m)
-        graph_a = build_graph(model, strategy_a)
+        graph_m = build_opgraph(model, strategy_m)
+        graph_a = build_opgraph(model, strategy_a)
 
         mb_m = memory_breakdown(graph_m, model, system, strategy_m)
         mb_a = memory_breakdown(graph_a, model, system, strategy_a)
@@ -696,14 +696,14 @@ class TestMuonNSPeakBuffer:
         regardless of DP or sequence length.
         """
         from zrt.training.models.memory import memory_breakdown
-        from zrt.training.ir.builders import build_graph
+        from zrt.training.ir.opgraph_builder import build_opgraph
 
         model = _make_mock_model()
         system = _make_mock_system()
         for dp in [1, 4, 64]:
             strategy = Strategy(tp=4, pp=4, dp=dp, micro_batch=1, zero_stage=2,
                                 optimizer=OptKind.MUON, muon_config=MuonConfig())
-            graph = build_graph(model, strategy)
+            graph = build_opgraph(model, strategy)
             mb = memory_breakdown(graph, model, system, strategy)
             expected_total = (mb.weights + mb.grads + mb.opt_state
                               + mb.activations + mb.comm_buffers + mb.muon_ns_buffer)

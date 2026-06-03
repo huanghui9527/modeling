@@ -7,7 +7,7 @@ from zrt.training.spec.model import LayerKind, ModelSpec
 from zrt.training.spec.strategy import OptKind, Strategy
 from zrt.training.spec.system import GPU, SystemSpec
 from zrt.hardware.spec import InterconnectSpec, LinkSpec
-from zrt.training.ir.training_graph import Graph
+from zrt.ir.graph import OpGraph
 
 
 def _make_system():
@@ -33,7 +33,7 @@ def _moe_model(**kwargs):
 
 def test_legacy_string_fp4_and_new_enum_produce_same_weight_bytes():
     """Back-compat: routed_expert_dtype='fp4' must match routed_expert_weight_dtype=Dtype.FP4."""
-    g, sys_, st = Graph(), _make_system(), Strategy(optimizer=OptKind.ADAM)
+    g, sys_, st = OpGraph(name="", phase=""), _make_system(), Strategy(optimizer=OptKind.ADAM)
     m_legacy = _moe_model(routed_expert_dtype="fp4")
     m_new    = _moe_model(routed_expert_weight_dtype=Dtype.FP4)
     mb_legacy = memory_breakdown(g, m_legacy, sys_, st)
@@ -43,7 +43,7 @@ def test_legacy_string_fp4_and_new_enum_produce_same_weight_bytes():
 
 def test_fp4_routed_expert_smaller_than_bf16():
     """FP4 routed expert weight should be ~3.5× smaller than BF16."""
-    g, sys_, st = Graph(), _make_system(), Strategy(optimizer=OptKind.ADAM)
+    g, sys_, st = OpGraph(name="", phase=""), _make_system(), Strategy(optimizer=OptKind.ADAM)
     m_bf16 = _moe_model()
     m_fp4 = _moe_model(routed_expert_weight_dtype=Dtype.FP4)
     mb_bf16 = memory_breakdown(g, m_bf16, sys_, st)
@@ -58,7 +58,7 @@ def test_fp4_routed_expert_smaller_than_bf16():
 
 
 def test_fp8_routed_expert_weight_halves_routed_bytes_vs_bf16():
-    g, sys_, st = Graph(), _make_system(), Strategy(optimizer=OptKind.ADAM)
+    g, sys_, st = OpGraph(name="", phase=""), _make_system(), Strategy(optimizer=OptKind.ADAM)
     m_bf16 = _moe_model()
     m_fp8 = _moe_model(routed_expert_weight_dtype=Dtype.FP8_E4M3)
     mb_bf16 = memory_breakdown(g, m_bf16, sys_, st)
@@ -67,7 +67,7 @@ def test_fp8_routed_expert_weight_halves_routed_bytes_vs_bf16():
 
 
 def test_shared_expert_weight_dtype_affects_shared_weight_bytes():
-    g, sys_, st = Graph(), _make_system(), Strategy(optimizer=OptKind.ADAM)
+    g, sys_, st = OpGraph(name="", phase=""), _make_system(), Strategy(optimizer=OptKind.ADAM)
     m_bf16 = _moe_model(shared_expert_weight_dtype=Dtype.BF16)
     m_fp8 = _moe_model(shared_expert_weight_dtype=Dtype.FP8_E4M3)
     mb_bf16 = memory_breakdown(g, m_bf16, sys_, st)
@@ -77,7 +77,7 @@ def test_shared_expert_weight_dtype_affects_shared_weight_bytes():
 
 def test_dense_model_unaffected_by_routed_dtype():
     """Dense model (no MoE layers) → routed_expert_weight_dtype has no effect."""
-    g, sys_, st = Graph(), _make_system(), Strategy(optimizer=OptKind.ADAM)
+    g, sys_, st = OpGraph(name="", phase=""), _make_system(), Strategy(optimizer=OptKind.ADAM)
     base = dict(
         hidden=512, ffn=2048, num_heads=8, num_kv_heads=8, head_dim=64,
         vocab=4096, seq_len=128, layers=[LayerKind.DENSE, LayerKind.DENSE],
@@ -91,7 +91,7 @@ def test_dense_model_unaffected_by_routed_dtype():
 
 def test_ep_a2a_buffer_uses_routed_compute_dtype():
     """EP A2A staging buffer should scale with routed_expert_compute_dtype."""
-    g = Graph()
+    g = OpGraph(name="", phase="")
     sys_ = _make_system()
     st = Strategy(ep=4, dp=1, optimizer=OptKind.ADAM)
     m_bf16 = _moe_model()
@@ -104,7 +104,7 @@ def test_ep_a2a_buffer_uses_routed_compute_dtype():
 
 
 def test_cp_a2a_buffer_uses_attn_act_dtype():
-    g = Graph()
+    g = OpGraph(name="", phase="")
     sys_ = _make_system()
     st = Strategy(cp=4, dp=1, optimizer=OptKind.ADAM)
     m_bf16 = _moe_model()
@@ -117,7 +117,7 @@ def test_cp_a2a_buffer_uses_attn_act_dtype():
 def test_qk_score_matrix_uses_attn_act_dtype():
     """Activations: QK^T score matrix term (~5·a·s²·bytes) should
     scale with attn_act_dtype when present."""
-    g = Graph()
+    g = OpGraph(name="", phase="")
     sys_ = _make_system()
     st = Strategy(optimizer=OptKind.ADAM)
     # Force long sequence so QK^T dominates
@@ -129,7 +129,7 @@ def test_qk_score_matrix_uses_attn_act_dtype():
 
 
 def test_routed_expert_grad_dtype_affects_grad_bytes_in_moe_models():
-    g = Graph()
+    g = OpGraph(name="", phase="")
     sys_ = _make_system()
     st = Strategy(optimizer=OptKind.ADAM)
     m_fp32 = _moe_model()
@@ -141,7 +141,7 @@ def test_routed_expert_grad_dtype_affects_grad_bytes_in_moe_models():
 
 
 def test_shared_expert_grad_dtype_affects_shared_grad_bytes():
-    g = Graph()
+    g = OpGraph(name="", phase="")
     sys_ = _make_system()
     st = Strategy(optimizer=OptKind.ADAM)
     m_fp32 = _moe_model(shared_expert_grad_dtype=Dtype.FP32)
@@ -152,7 +152,7 @@ def test_shared_expert_grad_dtype_affects_shared_grad_bytes():
 
 
 def test_shared_expert_dtype_bytes_respect_tp_and_pp_sharding():
-    g = Graph()
+    g = OpGraph(name="", phase="")
     sys_ = _make_system()
     st = Strategy(tp=2, pp=2, optimizer=OptKind.ADAM)
 
@@ -177,7 +177,7 @@ def test_shared_expert_dtype_bytes_respect_tp_and_pp_sharding():
 
 
 def test_dense_model_grad_unaffected_by_routed_expert_grad_dtype():
-    g, sys_, st = Graph(), _make_system(), Strategy(optimizer=OptKind.ADAM)
+    g, sys_, st = OpGraph(name="", phase=""), _make_system(), Strategy(optimizer=OptKind.ADAM)
     base = dict(hidden=512, ffn=2048, num_heads=8, num_kv_heads=8, head_dim=64,
                 vocab=4096, seq_len=128, layers=[LayerKind.DENSE, LayerKind.DENSE])
     m_fp32 = ModelSpec(**base)

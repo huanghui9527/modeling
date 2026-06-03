@@ -40,10 +40,39 @@ python -m python.zrt --model-id Qwen/Qwen2.5-7B-Instruct --layers 4 --hw nvidia_
 # 训练建模（3D 并行 + ZeRO + 重计算）
 python -m python.zrt --model-id deepseek-ai/DeepSeek-V3 --layers 4 --train --hw nvidia_h100_sxm --tp 8 --pp 4 --ep 2 --dp 2 --zero-stage 1 --optimizer adam --recompute-policy selective --total-params 671e9 --num-layers-full 61
 
-# Spec-based 训练估算（无需抓图）
+# 训练抓图（显式指定阶段）
+python -m python.zrt --model-id Qwen/Qwen2.5-7B-Instruct --layers 2 --phases train_forward train_backward
+
+# 仅抓训练前向
+python -m python.zrt --model-id Qwen/Qwen2.5-7B-Instruct --layers 2 --phases train_forward
+
+# 推理 + 训练混合（四阶段一次完成）
+python -m python.zrt --model-id Qwen/Qwen2.5-7B-Instruct --layers 4 --phases prefill decode train_forward train_backward
+
+# 训练性能建模（抓图 + 1F1B 调度 + MFU 估算）
+python -m python.zrt --model-id deepseek-ai/DeepSeek-V3 --layers 4 --train --hw nvidia_h100_sxm --tp 8
+
+# Graph-capture + MegaMoE（融合 routed expert dispatch / compute / combine）
+# --mega-moe-waves 0 表示自动选择合法 wave 数；也可以改成显式值，如 4。
+python -m python.zrt --model-id hf_models/deepseek_v4 --layers 4 --train --hw nvidia_h100_sxm --tp 8 --ep 8 --mega-moe --mega-moe-waves 0
+
+# 完整 3D 并行 + ZeRO + 批次配置
+python -m python.zrt --model-id hf_models/deepseek_v3 --layers 4 --train --hw nvidia_h100_sxm --tp 8 --pp 4 --ep 2 --dp 2 --zero-stage 1 --optimizer adam --micro-batch 1 --global-batch 1024 --total-params 671e9 --num-layers-full 61
+
+# 启用激活重计算
+python -m python.zrt --model-id Qwen/Qwen2.5-7B-Instruct --layers 4 --train --hw nvidia_h100_sxm --tp 8 --gradient-checkpointing
+
+# 激活重计算策略（none / full / selective）
+python -m python.zrt --model-id deepseek-ai/DeepSeek-V3 --layers 4 --train --hw nvidia_h100_sxm --tp 8 --recompute-policy full
+python -m python.zrt --model-id deepseek-ai/DeepSeek-V3 --layers 4 --train --hw nvidia_h100_sxm --tp 8 --recompute-policy selective
+
+# Spec-based 训练估算（无需抓图，纯分析）→ 默认输出 Excel
 python -m python.zrt --estimate-config python/zrt/training/configs/llama3_70b_3d.yaml
 
-# 并行策略网格搜索（输出 Pareto 前沿）
+# Spec-based MegaMoE 示例（YAML 内 strategy.mega_moe: true）
+python -m python.zrt --estimate-config python/zrt/training/configs/deepseek_v4_pro_3d_ascend_910c_mega_moe.yaml
+
+# 网格搜索（Pareto 前沿）
 python -m python.zrt --search-config python/zrt/training/configs/llama3_70b_3d.yaml
 
 # torch.compile 图模式（替代 eager TorchDispatchMode 路径）

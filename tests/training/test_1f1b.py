@@ -3,7 +3,7 @@
 import pytest
 from zrt.training.compose.schedules import OneF1BComposer, pipeline_step_time
 from zrt.training.compose.stage import StageTime
-from zrt.training.ir.builders import build_graph
+from zrt.training.ir.opgraph_builder import build_opgraph
 from zrt.training.spec.model import ModelSpec, LayerKind
 from zrt.training.spec.strategy import Strategy
 from zrt.hardware.spec import InterconnectSpec, LinkSpec
@@ -31,7 +31,7 @@ def test_single_stage_no_bubble():
     )
     system = _make_system()
     strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1, global_batch=4)
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
 
     result = pipeline_step_time(graph, model, system, strategy)
     assert result.bubble_fraction == 0.0
@@ -76,7 +76,7 @@ def test_pp2_bubble_ratio():
     system = _make_system()
     M = 4
     strategy = Strategy(tp=1, pp=2, dp=1, micro_batch=1, global_batch=M)
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
 
     result = pipeline_step_time(graph, model, system, strategy)
     # Bubble = warmup + cooldown, roughly (pp-1)/(pp-1+M) fraction
@@ -106,8 +106,8 @@ def test_step_time_increases_with_pp():
     s1 = Strategy(tp=1, pp=1, dp=1, micro_batch=1, global_batch=1)
     s2 = Strategy(tp=1, pp=2, dp=1, micro_batch=1, global_batch=1)
 
-    g1 = build_graph(model, s1)
-    g2 = build_graph(model, s2)
+    g1 = build_opgraph(model, s1)
+    g2 = build_opgraph(model, s2)
 
     r1 = pipeline_step_time(g1, model, system, s1)
     r2 = pipeline_step_time(g2, model, system, s2)
@@ -127,7 +127,7 @@ def test_mfu_positive_and_bounded():
     )
     system = _make_system()
     strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1, global_batch=4)
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
 
     result = pipeline_step_time(graph, model, system, strategy)
     assert 0 < result.mfu < 1.0

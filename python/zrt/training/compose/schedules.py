@@ -8,9 +8,14 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
+from typing import TYPE_CHECKING, Union
+
 from zrt.training.compose.stage import StageTime, stage_time
-from zrt.training.ir.training_graph import Graph
-from zrt.training.models.comm import total_comm_time, optimizer_comm_time
+from zrt.training.models.comm import CommSpec, comm_spec_from_node, total_comm_time, optimizer_comm_time
+
+if TYPE_CHECKING:
+    from zrt.ir.graph import OpGraph
+    from zrt.ir.node import OpNode
 from zrt.training.topology import CommDomain
 from zrt.training.models.flops import recompute_overhead_flops
 from zrt.training.models.memory import MemBreakdown, memory_breakdown
@@ -32,6 +37,33 @@ PP_SCHED_BY_NAME: dict[str, PPSched] = {
     "dualpipe": PPSched.DUALPIPE,
     "dualpipev": PPSched.DUALPIPE_V,
 }
+
+
+def _ops_for_stage(graph, layer_ids: list[int]) -> list:
+    if hasattr(graph, "ops_for_stage"):
+        return graph.ops_for_stage(layer_ids)
+    lid_set = set(str(lid) for lid in layer_ids)
+    return [n for n in graph.nodes.values() if not n.is_comm and n.layer in lid_set]
+
+
+def _collectives_for_stage(graph, layer_ids: list[int]) -> list:
+    if hasattr(graph, "collectives"):
+        prefixes = tuple(f"L{lid}." for lid in layer_ids)
+        return [
+            c for c in graph.collectives
+            if (c.inserted_after and c.inserted_after.startswith(prefixes)) or
+               (c.inserted_before and c.inserted_before.startswith(prefixes))
+        ]
+    prefixes = tuple(f"L{lid}." for lid in layer_ids)
+    result = []
+    for n in graph.nodes.values():
+        if not n.is_comm:
+            continue
+        ia = n.attrs.get("inserted_after", "")
+        ib = n.attrs.get("inserted_before", "")
+        if (ia and ia.startswith(prefixes)) or (ib and ib.startswith(prefixes)):
+            result.append(comm_spec_from_node(n))
+    return result
 
 
 @dataclass
@@ -710,54 +742,28 @@ COMPOSER_BY_SCHED: dict[PPSched, type[PipelineComposer]] = {
 
 
 def pipeline_step_time(
-        graph: Graph,
+        graph: "OpGraph",
         model: ModelSpec,
         system: SystemSpec,
         strategy: Strategy,
 ) -> StepResult:
-    """Compute full training step time from IR + strategy.
-
-    Graph-native counterpart: TrainingPipelinePass in transform/analysis/training.py
-    — uses per-stage timelines from DAGScheduler instead of formula-based stage_time().
-
-    Current path (IR-based reference implementation):
-      - Use IR-level stage_time() from graph.ops_for_stage()
-      - Apply 1F1B/VPP/DualPipe formulas on aggregated times
-      - DP overlap uses simple bubble-window heuristic
-
-    Both paths use the same PipelineComposer classes (OneF1BComposer, Interleaved1F1BComposer,
-    ZeroBubbleComposer, DualPipeComposer, DualPipeVComposer) and converge to the same
-    StepResult interface for compatibility.
-    """
+    """Compute full training step time from OpGraph + strategy."""
     pp = strategy.pp
     M = strategy.num_microbatches()
 
-    # One resolver per estimate() call. ParallelGroups is enumerated
-    # lazily on first .time(c) / .ranks() / .link() lookup, then cached
-    # so per-stage and per-collective queries all share it.
     domain = CommDomain(system=system, strategy=strategy)
 
-    # Compute per-stage times
     stage_ids = _assign_stages(model, strategy)
     stage_times: list[StageTime] = []
 
     for s in range(pp):
         layer_ids = stage_ids[s]
-        stage_ops = graph.ops_for_stage(layer_ids)
-
-        stage_colls = [
-            c for c in graph.collectives
-            if any(
-                (c.inserted_after and c.inserted_after.startswith(f"L{lid}.")) or
-                (c.inserted_before and c.inserted_before.startswith(f"L{lid}."))
-                for lid in layer_ids
-            )
-        ]
+        stage_ops = _ops_for_stage(graph, layer_ids)
+        stage_colls = _collectives_for_stage(graph, layer_ids)
 
         st = stage_time(stage_ops, stage_colls, model, system, strategy, domain=domain)
         stage_times.append(st)
 
-    # Compute DP allreduce time and PP P2P overhead
     comm_times = total_comm_time(graph, model, system, strategy, domain=domain)
     dp_ar_time = comm_times.get("dp_grad_reduce", 0.0)
 
@@ -1054,22 +1060,28 @@ def pipeline_step_time(
 
 
 def _populate_hbm_traffic(
-    step: "StepResult", graph: Graph, model: ModelSpec,
+    step: "StepResult", graph: "OpGraph", model: ModelSpec,
     system: SystemSpec, strategy: Strategy,
 ) -> None:
-    """Sum per-op HBM bytes by operand role and write into ``step``.
-
-    Splits each matmul's ``fwd_bytes`` into the (A, W, C) terms using the
-    ``OpDtypeBundle`` to avoid double-counting. Attention / elementwise
-    ops contribute to ``act_hbm``. Backward bytes (dx + dw) go to
-    ``grad_hbm``. cast ops feed ``cast_hbm`` independently.
-
-    Multiplied by ``M = num_microbatches()`` and divided by 1 GiB (== 2**30
-    bytes) at the end. Result is **per-step per-rank** — the graph is
-    already TP/EP-sharded by build_graph.
-    """
+    """Sum per-op HBM bytes by operand role and write into ``step``."""
     from zrt.training.models.flops import op_cost as _op_cost
     from zrt.training.models.quant import resolve_op_dtypes as _bundle
+
+    def _k(node):
+        if hasattr(node, "attrs"):
+            return node.attrs.get("spec_kind", node.op_type)
+        return node.kind
+
+    def _m(node):
+        return node.attrs if hasattr(node, "attrs") else node.meta
+
+    def _eshape(t):
+        return t.effective_shape if hasattr(t, "effective_shape") else t.shape_local
+
+    def _lshape(t):
+        if hasattr(t, "shape") and not hasattr(t, "shape_logical"):
+            return t.shape
+        return t.shape_logical
 
     GB = float(1 << 30)
     M = max(1, strategy.num_microbatches())
@@ -1079,41 +1091,42 @@ def _populate_hbm_traffic(
     grad_bytes = 0.0
     cast_bytes = 0.0
 
-    for op in graph.ops:
+    ops = graph.ops if hasattr(graph, "ops") else [n for n in graph.nodes.values() if not n.is_comm]
+    for op in ops:
         cost = _op_cost(op, model, system)
-        if op.kind == "cast":
+        k = _k(op)
+        if k == "cast":
             cast_bytes += cost.fwd_bytes + cost.dx_bytes
             continue
 
-        # Forward: split bytes into weight vs activation if matmul.
-        if op.kind == "matmul":
+        if k == "matmul":
             d = _bundle(op, model)
-            # _matmul_cost rebuilds these shapes; recompute to split.
-            meta_k = op.meta.get("k", 0)
+            meta = _m(op)
+            meta_k = meta.get("k", 0)
             use_meta = (
-                op.meta.get("fused_weight_dims", False)
+                meta.get("fused_weight_dims", False)
                 or not op.inputs or not op.outputs
-                or (meta_k > 0 and op.inputs[0].shape_logical[-1] != meta_k)
+                or (meta_k > 0 and _lshape(op.inputs[0])[-1] != meta_k)
             )
             if use_meta:
-                m = op.meta.get("m", 0)
-                n = op.meta.get("n_local", op.meta.get("n", 0))
-                k = op.meta.get("k_local", op.meta.get("k", 0))
+                m = meta.get("m", 0)
+                n = meta.get("n_local", meta.get("n", 0))
+                k_dim = meta.get("k_local", meta.get("k", 0))
             else:
-                m = op.inputs[0].shape_local[0]
-                k = op.inputs[0].shape_local[-1]
-                n = op.outputs[0].shape_local[-1]
-            mult = op.meta.get("fwd_multiplier", 1.0)
+                m = _eshape(op.inputs[0])[0]
+                k_dim = _eshape(op.inputs[0])[-1]
+                n = _eshape(op.outputs[0])[-1]
+            mult = meta.get("fwd_multiplier", 1.0)
             # Apply fwd_multiplier the same way _matmul_cost folds it into
             # FLOPs; for bytes the routed-expert fused op visits each of
             # the top_k expert tiles, so weight/act/grad bytes scale too.
             scale = float(mult)
-            weight_bytes += scale * (k * n * d.weight.stored_bytes
-                                     + k * n * d.weight.stored_bytes  # dx reads W
-                                     + k * n * d.grad_weight.stored_bytes)  # dw writes dW
-            act_bytes += scale * (m * k * d.in_act.bytes + m * n * d.out_act.bytes)
-            grad_bytes += scale * (m * n * d.grad_in.bytes + m * k * d.grad_act.bytes
-                                    + m * n * d.grad_in.bytes + m * k * d.in_act.bytes)
+            weight_bytes += scale * (k_dim * n * d.weight.stored_bytes
+                                     + k_dim * n * d.weight.stored_bytes
+                                     + k_dim * n * d.grad_weight.stored_bytes)
+            act_bytes += scale * (m * k_dim * d.in_act.bytes + m * n * d.out_act.bytes)
+            grad_bytes += scale * (m * n * d.grad_in.bytes + m * k_dim * d.grad_act.bytes
+                                    + m * n * d.grad_in.bytes + m * k_dim * d.in_act.bytes)
         else:
             # Non-matmul: lump all fwd bytes into act, bwd into grad.
             act_bytes += cost.fwd_bytes
@@ -1235,20 +1248,9 @@ def util_from_flops(flops: float, peak_flops_total: float, step_time_s: float) -
 def compute_mfu(
         model: ModelSpec, strategy: Strategy,
         system: SystemSpec, step_time: float,
-        graph: Graph,
+        graph: "OpGraph",
 ) -> float:
-    """Model FLOPs Utilization.
-
-    MFU = (total_training_flops / PP) / (per_gpu_peak * step_time)
-
-    total_training_flops is per-GPU (the graph models TP/EP-sharded computation),
-    so world_size cancels between numerator and denominator. We divide by PP
-    because the graph covers all layers but each GPU handles only 1/PP of them.
-
-    Uses actual graph-level FLOP accounting (Σ op_fwd+op_dx+op_dw × M)
-    instead of the 6P rule-of-thumb, which overestimates for MoE + low-rank
-    architectures (e.g. DeepSeek-V4: 6P gives 30× more FLOPs than actual).
-    """
+    """Model FLOPs Utilization."""
     from zrt.training.models.flops import total_training_flops
 
     tokens = strategy.global_batch * model.seq_len if strategy.global_batch > 0 else strategy.micro_batch * strategy.dp * model.seq_len
@@ -1270,12 +1272,9 @@ def compute_mfu(
 def compute_hfu(
         model: ModelSpec, strategy: Strategy,
         system: SystemSpec, step_time: float,
-        graph: Graph,
+        graph: "OpGraph",
 ) -> float:
-    """Hardware FLOPs Utilization — accounts for recomputed activations.
-
-    HFU = (actual_training_flops + recompute_overhead) / (peak * step_time)
-    """
+    """Hardware FLOPs Utilization — accounts for recomputed activations."""
     from zrt.training.models.flops import total_training_flops, recompute_overhead_flops
 
     actual_flops = total_training_flops(graph, model, strategy, system)
@@ -1295,18 +1294,9 @@ def compute_hfu(
 def compute_mfu_native(
         model: ModelSpec, strategy: Strategy,
         system: SystemSpec, step_time: float,
-        graph: Graph,
+        graph: "OpGraph",
 ) -> float:
-    """MFU with denominator = effective hardware peak under mixed precision.
-
-    The effective peak is the harmonic-mean of per-dtype peaks weighted
-    by per-dtype FLOPs share, derived from each op's component tag:
-
-      effective_peak = total_flops / Σ (flops_by_dtype[d] / peak_for[d])
-
-    Reduces to ``compute_mfu`` (BF16 peak) when all ops are BF16-typed.
-    Returns 0 when step_time <= 0 or total flops <= 0.
-    """
+    """MFU with denominator = effective hardware peak under mixed precision."""
     from zrt.training.io.perf_tables import peak_tflops_for
     from zrt.training.models.flops import op_cost, total_training_flops
     from zrt.training.compose.stage import _resolve_compute_dtype
@@ -1320,7 +1310,8 @@ def compute_mfu_native(
 
     # Aggregate per-dtype FLOPs by walking the graph
     flops_by_dtype: dict[Dtype, float] = {}
-    for op in graph.ops:
+    _ops = graph.ops if hasattr(graph, "ops") else [n for n in graph.nodes.values() if not n.is_comm]
+    for op in _ops:
         cost = op_cost(op, model, system)
         op_flops = (cost.fwd_cube_flops + cost.fwd_vector_flops
                     + cost.dx_cube_flops + cost.dx_vector_flops

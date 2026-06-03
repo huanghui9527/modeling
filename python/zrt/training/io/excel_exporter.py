@@ -26,6 +26,30 @@ if TYPE_CHECKING:
     from zrt.training.spec.report import TrainingReport
 
 
+def _iter_ops(graph):
+    """Iterate compute ops from either Graph or OpGraph.
+
+    For legacy Graph: returns ``graph.ops``.
+    For OpGraph: yields ``_OpNodeAsOp`` wrappers for non-comm nodes.
+    """
+    if hasattr(graph, "ops"):
+        return graph.ops
+    if hasattr(graph, "nodes"):
+        from zrt.training.models.flops import _OpNodeAsOp
+        return [_OpNodeAsOp(n) for n in graph.nodes.values() if not n.is_comm]
+    return []
+
+
+def _iter_collectives(graph):
+    """Iterate collectives from either Graph or OpGraph."""
+    if hasattr(graph, "collectives"):
+        return graph.collectives
+    if hasattr(graph, "nodes"):
+        from zrt.training.models.comm import comm_spec_from_node
+        return [comm_spec_from_node(n) for n in graph.nodes.values() if n.is_comm]
+    return []
+
+
 def export_estimate_excel(
     *,
     report: "TrainingReport",
@@ -81,7 +105,7 @@ def export_estimate_excel(
     from zrt.training.models.flops import op_cost as _op_cost
 
     operator_op_dicts = []
-    for op in graph.ops:
+    for op in _iter_ops(graph):
         cost = op_costs.get(op.name)
         if cost is None:
             cost = _op_cost(op, model, system)
@@ -96,7 +120,7 @@ def export_estimate_excel(
     def _comm_breakdown_label(group: str, fallback: str) -> str:
         kinds = sorted({
             getattr(c, "kind", "")
-            for c in getattr(graph, "collectives", [])
+            for c in _iter_collectives(graph)
             if getattr(c, "group", "") == group and getattr(c, "kind", "")
         })
         if not kinds:
@@ -267,7 +291,7 @@ def export_estimate_excel(
          "Fwd Bytes Formula", "Bwd Bytes Formula",
          "Latency (μs)"],
     ]
-    for idx, op in enumerate(graph.ops, 1):
+    for idx, op in enumerate(_iter_ops(graph), 1):
         cost = op_costs.get(op.name)
         if cost is None:
             from zrt.training.models.flops import op_cost as _op_cost
@@ -277,7 +301,8 @@ def export_estimate_excel(
         fwd_flops = cost.fwd_cube_flops + cost.fwd_vector_flops
         bwd_flops = cost.dx_cube_flops + cost.dx_vector_flops + cost.dw_cube_flops + cost.dw_vector_flops
         total_flops = fwd_flops + bwd_flops
-        layer_k = _LAYER_KIND_MAP.get(op.layer_kind.value, op.layer_kind.value)
+        _lk = op.layer_kind.value if hasattr(op.layer_kind, "value") else str(op.layer_kind)
+        layer_k = _LAYER_KIND_MAP.get(_lk, _lk)
 
         # Compute latency from FLOPs/bytes using roofline model (hetero-aware)
         gpu_name = system.gpu.name
@@ -431,6 +456,8 @@ def export_estimate_excel(
         ["Optimizer", strategy.optimizer.value, ""],
         ["TP Overlap", strategy.tp_overlap.value, ""],
         ["EP Overlap", str(strategy.ep_overlap), ""],
+        ["Mega MoE", str(strategy.mega_moe), ""],
+        ["Mega MoE Waves", strategy.mega_moe_waves, ""],
         ["Dual-Batch Overlap", str(strategy.dualbatch), ""],
         ["", "", ""],
         ["Recompute", "", ""],

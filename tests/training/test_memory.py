@@ -1,7 +1,7 @@
 """Test memory model — ZeRO stages, activation scaling."""
 
 import pytest
-from zrt.training.ir.builders import build_graph
+from zrt.training.ir.opgraph_builder import build_opgraph
 from zrt.training.models.memory import memory_breakdown
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import ModelSpec, LayerKind
@@ -35,7 +35,7 @@ def test_zero_0_no_sharding():
     model = _make_model()
     system = _make_system()
     strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1, zero_stage=0)
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
     mem = memory_breakdown(graph, model, system, strategy)
 
     assert mem.opt_state > 0
@@ -50,9 +50,9 @@ def test_zero_1_divides_opt_state():
     strategy_z0 = Strategy(tp=1, pp=1, dp=4, micro_batch=1, zero_stage=0)
     strategy_z1 = Strategy(tp=1, pp=1, dp=4, micro_batch=1, zero_stage=1)
 
-    graph = build_graph(model, strategy_z0)
+    graph = build_opgraph(model, strategy_z0)
     mem_z0 = memory_breakdown(graph, model, system, strategy_z0)
-    graph1 = build_graph(model, strategy_z1)
+    graph1 = build_opgraph(model, strategy_z1)
     mem_z1 = memory_breakdown(graph1, model, system, strategy_z1)
 
     # ZeRO-1 should reduce opt_state by ~4x
@@ -67,9 +67,9 @@ def test_zero_2_divides_grads_and_opt():
     strategy_z0 = Strategy(tp=1, pp=1, dp=4, micro_batch=1, zero_stage=0)
     strategy_z2 = Strategy(tp=1, pp=1, dp=4, micro_batch=1, zero_stage=2)
 
-    graph_z0 = build_graph(model, strategy_z0)
+    graph_z0 = build_opgraph(model, strategy_z0)
     mem_z0 = memory_breakdown(graph_z0, model, system, strategy_z0)
-    graph_z2 = build_graph(model, strategy_z2)
+    graph_z2 = build_opgraph(model, strategy_z2)
     mem_z2 = memory_breakdown(graph_z2, model, system, strategy_z2)
 
     # ZeRO-2 should reduce opt_state and grads by ~4x
@@ -87,8 +87,8 @@ def test_tp_reduces_weights():
     strategy_1 = Strategy(tp=1, pp=1, dp=1, micro_batch=1)
     strategy_2 = Strategy(tp=2, pp=1, dp=1, micro_batch=1)
 
-    graph1 = build_graph(model, strategy_1)
-    graph2 = build_graph(model, strategy_2)
+    graph1 = build_opgraph(model, strategy_1)
+    graph2 = build_opgraph(model, strategy_2)
     mem1 = memory_breakdown(graph1, model, system, strategy_1)
     mem2 = memory_breakdown(graph2, model, system, strategy_2)
 
@@ -102,7 +102,7 @@ def test_memory_total_positive():
     model = _make_model()
     system = _make_system()
     strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1)
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
     mem = memory_breakdown(graph, model, system, strategy)
 
     assert mem.total > 0
@@ -119,8 +119,8 @@ def test_activation_memory_scales_with_microbatch():
     s1 = Strategy(tp=1, pp=1, dp=1, micro_batch=1)
     s2 = Strategy(tp=1, pp=1, dp=1, micro_batch=2)
 
-    g1 = build_graph(model, s1)
-    g2 = build_graph(model, s2)
+    g1 = build_opgraph(model, s1)
+    g2 = build_opgraph(model, s2)
     m1 = memory_breakdown(g1, model, system, s1)
     m2 = memory_breakdown(g2, model, system, s2)
 
@@ -146,7 +146,7 @@ def test_activation_memory_includes_attention_scores_term():
     strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1,
                         recompute=RecomputePolicy())
 
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
     mem = memory_breakdown(graph, model, system, strategy)
 
     # Per-layer scores term: 5·a·s²·bytes = 5·32·2048²·2 ≈ 1.34 GB
@@ -168,8 +168,8 @@ def test_attn_recompute_eliminates_scores_term():
     strat_on = Strategy(tp=1, pp=1, dp=1, micro_batch=1,
                         recompute=RecomputePolicy(per_layer={"dense": {"attn_core"}}))
 
-    g_off = build_graph(model, strat_off)
-    g_on = build_graph(model, strat_on)
+    g_off = build_opgraph(model, strat_off)
+    g_on = build_opgraph(model, strat_on)
     m_off = memory_breakdown(g_off, model, system, strat_off)
     m_on = memory_breakdown(g_on, model, system, strat_on)
 
@@ -193,7 +193,7 @@ from zrt.training.spec.strategy import PPSched
 
 def _act_only(model, strategy):
     """Run memory_breakdown and return just the activations field."""
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
     return memory_breakdown(graph, model, _make_system(), strategy).activations
 
 
@@ -267,7 +267,7 @@ def test_phase_peak_is_max_not_sum():
         tp=1, pp=1, dp=1, micro_batch=1, global_batch=1,
         zero_stage=0, recompute=RecomputePolicy(),
     )
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
     mb = memory_breakdown(graph, model, system, strategy)
 
     # Phase peaks must equal the documented compositions.
@@ -299,7 +299,7 @@ def test_to_gb_includes_peak_keys():
         tp=1, pp=1, dp=1, micro_batch=1, global_batch=1,
         recompute=RecomputePolicy(),
     )
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
     gb = memory_breakdown(graph, model, system, strategy).to_gb()
     for key in ("peak_gb", "peak_forward_gb", "peak_backward_gb",
                 "peak_optimizer_gb"):

@@ -61,9 +61,11 @@ def test_train_hw_cli_delegates_to_graph_native_modeller(monkeypatch, capsys):
         hidden=4096,
         num_layers_full=32,
         quant=None,
-        pp_schedule="1f1b",
-        vpp_chunks=1,
-        tp_coc=None,
+        pp_schedule="dualpipev",
+        vpp_chunks=2,
+        pp_mode="formula",
+        mega_moe=True,
+        mega_moe_waves=4,
     )
     fwd_graph = object()
     bwd_graph = object()
@@ -88,4 +90,9 @@ def test_train_hw_cli_delegates_to_graph_native_modeller(monkeypatch, capsys):
     assert calls[0]["cp"] == 5
     assert calls[0]["cp_kind"] == "ring"
     assert calls[0]["zero_stage"] == 2
+    assert calls[0]["pp_schedule"] == "dualpipev"
+    assert calls[0]["vpp_chunks"] == 2
+    assert calls[0]["pp_mode"] == "formula"
+    assert calls[0]["mega_moe"] is True
+    assert calls[0]["mega_moe_waves"] == 4
     assert "graph-native report" in capsys.readouterr().out

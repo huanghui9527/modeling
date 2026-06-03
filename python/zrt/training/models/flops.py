@@ -10,10 +10,129 @@ import math
 from dataclasses import dataclass
 
 from zrt.training.ir.training_graph import Graph, Op
+from zrt.training.models.mega_moe import mega_moe_cost_terms
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import ModelSpec
 from zrt.training.spec.strategy import Strategy
 from zrt.training.spec.system import SystemSpec
+
+
+class _TensorMetaAsTensor:
+    """Lightweight adapter: wraps TensorMeta to provide Tensor's shape_local.
+
+    TensorMeta.shape_local can be None (pre-sharding), but old Tensor always
+    had shape_local set. This wrapper ensures shape_local is never None by
+    falling back to shape (effective_shape).
+    """
+
+    __slots__ = ("_tm",)
+
+    def __init__(self, tm):
+        self._tm = tm
+
+    @property
+    def shape_local(self) -> tuple[int, ...]:
+        return self._tm.shape_local if self._tm.shape_local is not None else self._tm.shape
+
+    @property
+    def shape_logical(self) -> tuple[int, ...]:
+        return self._tm.shape
+
+    @property
+    def dtype(self):
+        return self._tm.dtype
+
+    @property
+    def name(self) -> str:
+        return self._tm.id
+
+    def nbytes(self) -> int:
+        return self._tm.nbytes()
+
+    def num_elements(self) -> int:
+        return self._tm.num_elements()
+
+
+class _OpNodeAsOp:
+    """Lightweight adapter: wraps OpNode to provide an Op-like interface.
+
+    Used by ``op_cost`` and friends to consume OpGraph nodes without
+    changing the existing cost functions.
+
+    Field mapping:
+      - ``kind``  ← ``node.attrs["spec_kind"]``
+      - ``meta``  ← ``node.attrs``
+      - ``name``  ← ``node.id``
+      - ``layer_id`` ← ``int(node.layer)``
+      - ``inputs`` / ``outputs`` ← wrapped TensorMeta (shape_local never None)
+      - ``component`` ← ``node.component``
+    """
+
+    __slots__ = ("_node", "_inputs", "_outputs")
+
+    def __init__(self, node):
+        self._node = node
+        self._inputs = [_TensorMetaAsTensor(t) for t in node.inputs]
+        self._outputs = [_TensorMetaAsTensor(t) for t in node.outputs]
+
+    @property
+    def kind(self) -> str:
+        return self._node.attrs.get("spec_kind", self._node.op_type)
+
+    @property
+    def meta(self) -> dict:
+        return self._node.attrs
+
+    @property
+    def name(self) -> str:
+        return self._node.id
+
+    @property
+    def layer_id(self) -> int:
+        try:
+            return int(self._node.layer)
+        except (ValueError, TypeError):
+            return -1
+
+    @property
+    def layer_kind(self):
+        return self._node.attrs.get("layer_kind", "dense")
+
+    @property
+    def inputs(self):
+        return self._inputs
+
+    @property
+    def outputs(self):
+        return self._outputs
+
+    @property
+    def component(self):
+        return self._node.component
+
+
+def _is_opgraph(graph) -> bool:
+    """Return True if graph is an OpGraph (has .nodes dict, no .ops list)."""
+    return not hasattr(graph, "ops") and hasattr(graph, "nodes")
+
+
+def _iter_ops(graph):
+    """Iterate compute ops from either Graph or OpGraph.
+
+    For old Graph: returns ``graph.ops``.
+    For OpGraph: yields ``_OpNodeAsOp`` wrappers for non-comm nodes.
+    """
+    if hasattr(graph, "ops"):
+        return graph.ops
+    return [_OpNodeAsOp(n) for n in graph.nodes.values() if not n.is_comm]
+
+
+def op_cost_from_node(node, model: ModelSpec, system: SystemSpec | None = None) -> OpCost:
+    """Compute OpCost from an OpNode (OpGraph path).
+
+    Thin wrapper around ``op_cost`` that adapts the OpNode to the Op interface.
+    """
+    return op_cost(_OpNodeAsOp(node), model, system)
 
 
 @dataclass
@@ -50,8 +169,13 @@ def _bytes_from_tensors(op: Op) -> float:
     return float(sum(t.nbytes() for t in op.inputs) + sum(t.nbytes() for t in op.outputs))
 
 
-def op_cost(op: Op, model: ModelSpec, system: SystemSpec | None = None) -> OpCost:
-    """Compute raw cost per op (FLOPs + bytes for roofline timing)."""
+def op_cost(op, model: ModelSpec, system: SystemSpec | None = None) -> OpCost:
+    """Compute raw cost per op (FLOPs + bytes for roofline timing).
+
+    Accepts both legacy ``Op`` and ``OpNode`` (auto-wrapped via ``_OpNodeAsOp``).
+    """
+    if hasattr(op, "attrs") and not hasattr(op, "kind"):
+        op = _OpNodeAsOp(op)
     if op.kind == "matmul":
         return _matmul_cost(op, model)
     if op.kind == "sparse_attn":
@@ -76,6 +200,8 @@ def op_cost(op: Op, model: ModelSpec, system: SystemSpec | None = None) -> OpCos
         return _embed_cost(op)
     if op.kind == "lm_head":
         return _matmul_cost(op, model)
+    if op.kind == "mega_moe":
+        return _mega_moe_cost(op)
     if op.kind == "compressor_pool":
         return _compressor_pool_cost(op)
     if op.kind == "indexer_topk":
@@ -227,6 +353,18 @@ def _matmul_cost(op: Op, model: "ModelSpec | None" = None) -> OpCost:
         fwd_cube_flops=fwd,
         dx_cube_flops=dx,
         dw_cube_flops=dw,
+    )
+
+
+def _mega_moe_cost(op: Op) -> OpCost:
+    terms = mega_moe_cost_terms(op)
+    return OpCost(
+        fwd_bytes=terms.fwd_bytes,
+        dx_bytes=terms.fwd_bytes,
+        dw_bytes=terms.fwd_bytes,
+        fwd_cube_flops=terms.fwd_flops,
+        dx_cube_flops=terms.fwd_flops,
+        dw_cube_flops=terms.fwd_flops,
     )
 
 
@@ -731,7 +869,7 @@ def _accounted_flops(cost: OpCost, phase: str) -> float:
 
 
 def total_training_flops(
-    graph: Graph, model: ModelSpec, strategy: Strategy,
+    graph, model: ModelSpec, strategy: Strategy,
     system: SystemSpec,
 ) -> float:
     """Total FLOPs per training step (forward + backward).
@@ -743,9 +881,11 @@ def total_training_flops(
 
     Including memory-bound ops in the FLOP numerator while their time
     cost sits in the denominator (step_time) would artificially inflate MFU.
+
+    Accepts both legacy ``Graph`` (with ``.ops``) and ``OpGraph`` (with ``.nodes``).
     """
     total = 0.0
-    for op in graph.ops:
+    for op in _iter_ops(graph):
         cost = op_cost(op, model, system)
         for phase in ("fwd", "dx", "dw"):
             if _is_compute_bound(cost, phase, system):
@@ -759,16 +899,18 @@ def total_training_flops(
 
 
 def forward_backward_flops(
-    graph: Graph, model: ModelSpec, strategy: Strategy,
+    graph, model: ModelSpec, strategy: Strategy,
     system: SystemSpec,
 ) -> tuple[float, float]:
     """Return (forward_flops, backward_flops) separately.
 
     Same loop as total_training_flops but splits fwd from dx+dw.
+
+    Accepts both legacy ``Graph`` (with ``.ops``) and ``OpGraph`` (with ``.nodes``).
     """
     fwd = 0.0
     bwd = 0.0
-    for op in graph.ops:
+    for op in _iter_ops(graph):
         cost = op_cost(op, model, system)
         if _is_compute_bound(cost, "fwd", system):
             fwd += _accounted_flops(cost, "fwd")
@@ -781,13 +923,13 @@ def forward_backward_flops(
 
 
 def recompute_overhead_flops(
-    graph: Graph, model: ModelSpec, strategy: Strategy,
+    graph, model: ModelSpec, strategy: Strategy,
     system: SystemSpec,
 ) -> float:
     """Extra FLOPs from recomputing forward activations during backward pass.
 
-    Selective recompute re-runs the forward for specific ops (typically attention)
-    during backward. Full recompute re-runs the entire forward pass.
+    Selective recompute re-runs the forward for specific ops (typically attention).
+    Full recompute re-runs the entire forward pass.
 
     Respects per-layer policies: only ops belonging to a layer whose kind
     appears in ``RecomputePolicy.per_layer`` are counted.
@@ -801,6 +943,8 @@ def recompute_overhead_flops(
     attention. So we skip those op kinds from the overhead; non-FA targets
     (QKV/O linear projections, indexer/compressor, swiGLU, ln) keep their
     existing accounting.
+
+    Accepts both legacy ``Graph`` (with ``.ops``) and ``OpGraph`` (with ``.nodes``).
     """
     rc = strategy.recompute
     if not rc.per_layer:
@@ -809,7 +953,7 @@ def recompute_overhead_flops(
     FA_KERNEL_KINDS = {"attn_core", "sparse_attn", "hca_attn", "swa_attn"}
 
     extra = 0.0
-    for op in graph.ops:
+    for op in _iter_ops(graph):
         # Look up the layer kind for this op
         if op.layer_id < 0 or op.layer_id >= len(model.layers):
             continue
@@ -854,6 +998,8 @@ def _op_recompute_categories(op: Op) -> set[str]:
     - ``"ln"`` — LayerNorm / RMSNorm.
     - ``"hc"`` — DeepSeek-V4 mhc_pre / mhc_post / mhc_head.
     """
+    if hasattr(op, "attrs") and not hasattr(op, "kind"):
+        op = _OpNodeAsOp(op)
     if op.kind in ("attn_core", "sparse_attn", "hca_attn", "swa_attn"):
         # FA kernel: in scope for both selective ("attn_core") and block
         # recompute ("attn_block"). Note: FA kernel forwards are still

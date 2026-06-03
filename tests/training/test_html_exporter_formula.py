@@ -1,12 +1,45 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from zrt.training.io.html_exporter import _op_detail
-from zrt.training.ir.training_graph import Op, Tensor
 from zrt.training.models.flops import OpCost, op_cost
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import LayerKind, ModelSpec
 from zrt.training.spec.system import GPU, SystemSpec
 from zrt.hardware.spec import InterconnectSpec, LinkSpec
+
+
+class _FakeTensor:
+    def __init__(self, name, shape_logical, shape_local, dtype, is_activation=False, is_param=False):
+        self.name = name
+        self.shape_logical = shape_logical
+        self.shape_local = shape_local
+        self.dtype = dtype
+        self.is_activation = is_activation
+        self.is_param = is_param
+
+    def num_elements(self) -> int:
+        result = 1
+        for d in self.shape_local:
+            result *= d
+        return result
+
+    def nbytes(self) -> int:
+        return self.num_elements() * self.dtype.bytes
+
+
+def _Op(name, kind, inputs=None, outputs=None, meta=None, component=None, **kw):
+    return SimpleNamespace(
+        name=name,
+        kind=kind,
+        inputs=inputs or [],
+        outputs=outputs or [],
+        meta=meta or {},
+        component=component,
+        layer_id=kw.get("layer_id", -1),
+        layer_kind=kw.get("layer_kind", LayerKind.DENSE),
+    )
 
 
 def _model() -> ModelSpec:
@@ -42,11 +75,11 @@ def _system() -> SystemSpec:
 
 
 def test_matmul_formula_uses_local_sharded_dimensions():
-    op = Op(
+    op = _Op(
         name="L0.wq_a",
         kind="matmul",
         inputs=[
-            Tensor(
+            _FakeTensor(
                 name="x_ln1",
                 shape_logical=(4096, 4096),
                 shape_local=(2048, 4096),
@@ -55,7 +88,7 @@ def test_matmul_formula_uses_local_sharded_dimensions():
             )
         ],
         outputs=[
-            Tensor(
+            _FakeTensor(
                 name="qr",
                 shape_logical=(4096, 1024),
                 shape_local=(2048, 128),
@@ -75,11 +108,11 @@ def test_matmul_formula_uses_local_sharded_dimensions():
 
 
 def test_meta_authoritative_matmul_formula_keeps_local_meta_dimensions():
-    op = Op(
+    op = _Op(
         name="L0.routed_expert_ffn",
         kind="matmul",
         inputs=[
-            Tensor(
+            _FakeTensor(
                 name="x_ln2",
                 shape_logical=(4096, 7168),
                 shape_local=(4096, 7168),
@@ -88,7 +121,7 @@ def test_meta_authoritative_matmul_formula_keeps_local_meta_dimensions():
             )
         ],
         outputs=[
-            Tensor(
+            _FakeTensor(
                 name="routed_ffn_out",
                 shape_logical=(4096, 7168),
                 shape_local=(4096, 224),
@@ -115,11 +148,11 @@ def test_meta_authoritative_matmul_formula_keeps_local_meta_dimensions():
 
 
 def test_matmul_bwd_bytes_formula_matches_dx_plus_dw_bytes():
-    op = Op(
+    op = _Op(
         name="L0.ffn_up",
         kind="matmul",
         inputs=[
-            Tensor(
+            _FakeTensor(
                 name="x",
                 shape_logical=(128, 256),
                 shape_local=(128, 256),
@@ -128,7 +161,7 @@ def test_matmul_bwd_bytes_formula_matches_dx_plus_dw_bytes():
             )
         ],
         outputs=[
-            Tensor(
+            _FakeTensor(
                 name="y",
                 shape_logical=(128, 512),
                 shape_local=(128, 512),
@@ -153,11 +186,11 @@ def test_mixed_quant_matmul_bytes_formula_shows_per_operand_dtypes():
     model.moe_act_dtype = Dtype.FP8_E4M3
     model.routed_expert_compute_dtype = Dtype.FP8_E4M3
     model.routed_expert_weight_dtype = Dtype.FP4
-    op = Op(
+    op = _Op(
         name="L0.routed_expert_ffn",
         kind="matmul",
         inputs=[
-            Tensor(
+            _FakeTensor(
                 name="x",
                 shape_logical=(128, 256),
                 shape_local=(128, 256),
@@ -166,7 +199,7 @@ def test_mixed_quant_matmul_bytes_formula_shows_per_operand_dtypes():
             )
         ],
         outputs=[
-            Tensor(
+            _FakeTensor(
                 name="y",
                 shape_logical=(128, 512),
                 shape_local=(128, 512),
@@ -190,11 +223,11 @@ def test_mixed_quant_matmul_bytes_formula_shows_per_operand_dtypes():
 
 
 def test_embed_bwd_bytes_formula_matches_dx_plus_dw_bytes():
-    op = Op(
+    op = _Op(
         name="embed",
         kind="embed",
         inputs=[
-            Tensor(
+            _FakeTensor(
                 name="token_ids",
                 shape_logical=(128,),
                 shape_local=(128,),
@@ -203,7 +236,7 @@ def test_embed_bwd_bytes_formula_matches_dx_plus_dw_bytes():
             )
         ],
         outputs=[
-            Tensor(
+            _FakeTensor(
                 name="x",
                 shape_logical=(128, 256),
                 shape_local=(128, 256),
@@ -223,7 +256,7 @@ def test_embed_bwd_bytes_formula_matches_dx_plus_dw_bytes():
 
 
 def test_attention_bytes_formula_is_tile_and_dtype_aware():
-    op = Op(
+    op = _Op(
         name="L0.swa_attn",
         kind="swa_attn",
         meta={
@@ -252,11 +285,11 @@ def test_attention_bytes_formula_is_tile_and_dtype_aware():
 def test_formula_cells_do_not_look_like_excel_formulas():
     ops_and_costs = [
         (
-            Op(name="L0.mhc_pre_attn", kind="mhc_pre"),
+            _Op(name="L0.mhc_pre_attn", kind="mhc_pre"),
             OpCost(fwd_bytes=26_460_000, dx_bytes=39_690_000),
         ),
         (
-            Op(name="L0.comp_pool", kind="compressor_pool", meta={"s": 4096, "m": 4, "coff": 1, "d": 512}),
+            _Op(name="L0.comp_pool", kind="compressor_pool", meta={"s": 4096, "m": 4, "coff": 1, "d": 512}),
             OpCost(fwd_cube_flops=2_097_152, dx_cube_flops=2_097_152, fwd_bytes=1_000_000, dx_bytes=1_500_000),
         ),
     ]

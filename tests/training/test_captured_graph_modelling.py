@@ -117,6 +117,27 @@ def _captured_style_graph(seq_len=2048, hidden=4096, ffn=16384, num_layers=32) -
 
 # ── Tests ──────────────────────────────────────────────────────────────────────
 
+def test_estimate_training_from_graphs_passes_mega_moe_fields_to_context():
+    from zrt.transform.analysis import estimate_training_from_graphs
+
+    hw = _hw()
+    x = TensorMeta.from_shape_dtype("x", (2, 4), DType.BF16)
+    y = TensorMeta.from_shape_dtype("y", (2, 4), DType.BF16)
+    node = OpNode(id="n0", op_type="aten.add.Tensor", inputs=[x], outputs=[y])
+    graph = OpGraph("cfg", "train_forward", nodes={"n0": node})
+
+    _report, ctx, _graphs = estimate_training_from_graphs(
+        forward_graph=graph,
+        hw_spec=hw,
+        return_transformed=True,
+        mega_moe=True,
+        mega_moe_waves=4,
+    )
+
+    assert ctx.training.mega_moe is True
+    assert ctx.training.mega_moe_waves == 4
+
+
 def test_pipeline_routing_runs_roofline_and_stream_assign():
     """estimate_training_from_graphs() via build_default_pipeline must run RooflinePass + StreamAssignPass.
 

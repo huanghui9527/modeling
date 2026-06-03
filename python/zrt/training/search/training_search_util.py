@@ -202,6 +202,7 @@ def _system_from_hw(
             cube_tflops=hw.compute.cube_bf16_tflops,
             vector_tflops=hw.compute.vector_bf16_tflops,
             overlap_ratio=dict(hw.compute.overlap_ratio),
+            ep_overlap_waves=hw.compute.ep_overlap_waves,
             compute_efficiency=hw.compute.compute_efficiency,
             mem_bw_efficiency=hw.memory.mem_bw_efficiency,
         ),
@@ -364,6 +365,8 @@ def _make_strategy_from_config(config: Dict) -> Strategy:
         muon_config=muon_config,
         tp_overlap=TPOverlap(config.get("tp_overlap", "none")),
         ep_overlap=config.get("ep_overlap", False),
+        mega_moe=config.get("mega_moe", False),
+        mega_moe_waves=int(config.get("mega_moe_waves", 0)),
         cp_kind=CPKind(config.get("cp_kind", "none")),
         cp_ulysses=config.get("cp_ulysses"),
         cp_ring=config.get("cp_ring"),
@@ -447,6 +450,8 @@ class TrainingConfigManager:
             muon_config=muon_config,
             tp_overlap=TPOverlap(other_config.get("tp_overlap", "none")),
             ep_overlap=other_config.get("ep_overlap", False),
+            mega_moe=other_config.get("mega_moe", False),
+            mega_moe_waves=int(other_config.get("mega_moe_waves", 0)),
             cp_kind=CPKind(other_config.get("cp_kind", "none")),
             cp_ulysses=other_config.get("cp_ulysses"),
             cp_ring=other_config.get("cp_ring"),
@@ -804,7 +809,7 @@ def _batched(iterable, batch_size: int):
 
 
 def run_training_task_wrapper(config: Dict) -> Optional[Dict]:
-    from zrt.training.ir.builders import build_graph
+    from zrt.training.ir.opgraph_builder import build_explicit_graph
 
     model_name = config.get("model", "deepseek_v3_2")
     hw_name = config.get("hw", "nvidia_h100_sxm")
@@ -854,7 +859,7 @@ def run_training_task_wrapper(config: Dict) -> Optional[Dict]:
         graph_key = _graph_cache_key(config)
         graph = _WORKER_GRAPH_CACHE.get(graph_key)
         if graph is None:
-            graph = build_graph(model, strategy)
+            graph = build_explicit_graph(model, strategy)
             _WORKER_GRAPH_CACHE[graph_key] = graph
         report = estimate(model, system, strategy, graph=graph)
 
@@ -1375,8 +1380,8 @@ def export_best_configs_excel(
         all_results: List[Dict],
         output_path: str
 ) -> None:
-    from zrt.training.ir.builders import build_graph
-    from zrt.training.models.flops import op_cost as _op_cost
+    from zrt.training.ir.opgraph_builder import build_explicit_graph
+    from zrt.training.models.flops import op_cost_from_node as _op_cost_from_node
     from zrt.training.io.excel_exporter import export_estimate_excel
 
     if not all_results:
@@ -1423,10 +1428,11 @@ def export_best_configs_excel(
 
         strategy = _make_strategy_from_config(best_config)
 
-        graph = build_graph(model, strategy)
+        graph = build_explicit_graph(model, strategy)
         op_costs = {}
-        for op in graph.ops:
-            op_costs[op.name] = _op_cost(op, model, system)
+        for node in graph.nodes.values():
+            if not node.is_comm:
+                op_costs[node.id] = _op_cost_from_node(node, model, system)
 
         excel_name = f"{model_name}_{hw_name}_seq{seq_len}_ws{world_size}_best.xlsx"
         excel_path = os.path.join(output_path, excel_name)
@@ -1631,8 +1637,8 @@ if __name__ == "__main__":
         "model": ["deepseek_v4_pro"],
         "hw": ["nvidia_b300", "nvidia_gb300_nvl576", "ascend_910c"],
         "world_size": [8192],
-        "tp": [1, 2, 4, 8, 16, 32, 64, 128],
-        "cp": [1, 2, 4, 8, 16, 32, 64, 128],
+        "tp": [1, 2, 4, 8,],
+        "cp": [1, 2, 4, 8,],
         "pp": [1, 2, 4, 8, 16],
         # EP must divide DP under the current expert-DP sharding model.
         "ep": [32, 64, 128],

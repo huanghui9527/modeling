@@ -133,7 +133,14 @@ class ModelSpec:
                 f"got {self.attn_compression_ratio}"
             )
 
-        # Validate compressed-CP layer distribution (count-based only)
+        # Validate compressed-CP layer distribution.
+        if self.compress_ratios and len(self.compress_ratios) != len(self.layers):
+            raise ValueError(
+                f"compress_ratios length ({len(self.compress_ratios)}) "
+                f"must match total layers ({len(self.layers)})"
+            )
+
+        # Count-based fallback for legacy specs without per-layer ratios.
         total_compressed_layers = self.num_csa_layers + self.num_hca_layers + self.num_swa_only_layers
         if total_compressed_layers > 0:
             if total_compressed_layers != len(self.layers):

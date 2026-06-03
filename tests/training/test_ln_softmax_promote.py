@@ -1,12 +1,25 @@
 """Tests for FP32-promote-aware bytes on softmax / LN / RMSNorm (Stage C3)."""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
-from zrt.training.ir.training_graph import Op, Tensor
 from zrt.training.models.flops import op_cost
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import LayerKind, ModelSpec
+
+
+def _tensor(name: str, shape: tuple[int, ...], dtype: Dtype):
+    n = 1
+    for d in shape:
+        n *= d
+    return SimpleNamespace(
+        name=name, shape_logical=shape, shape_local=shape,
+        dtype=dtype, is_activation=True,
+        num_elements=lambda: n,
+        nbytes=lambda: n * dtype.bytes,
+    )
 
 
 def _model(act_dtype=Dtype.BF16):
@@ -17,26 +30,20 @@ def _model(act_dtype=Dtype.BF16):
 
 
 def _ln_op(seq: int, h: int, in_dtype: Dtype, out_dtype: Dtype, kind: str = "rmsnorm"):
-    return Op(
+    return SimpleNamespace(
         name="L0.ln1", kind=kind,
-        inputs=[Tensor(name="x", shape_logical=(seq, h), shape_local=(seq, h),
-                       dtype=in_dtype, is_activation=True)],
-        outputs=[Tensor(name="y", shape_logical=(seq, h), shape_local=(seq, h),
-                        dtype=out_dtype, is_activation=True)],
+        inputs=[_tensor("x", (seq, h), in_dtype)],
+        outputs=[_tensor("y", (seq, h), out_dtype)],
         meta={},
         layer_id=0, layer_kind=LayerKind.DENSE, component="norm",
     )
 
 
 def _softmax_op(b: int, h: int, s: int, in_dtype: Dtype):
-    return Op(
+    return SimpleNamespace(
         name="L0.softmax", kind="softmax",
-        inputs=[Tensor(name="scores", shape_logical=(b, h, s, s),
-                       shape_local=(b, h, s, s), dtype=in_dtype,
-                       is_activation=True)],
-        outputs=[Tensor(name="probs", shape_logical=(b, h, s, s),
-                        shape_local=(b, h, s, s), dtype=in_dtype,
-                        is_activation=True)],
+        inputs=[_tensor("scores", (b, h, s, s), in_dtype)],
+        outputs=[_tensor("probs", (b, h, s, s), in_dtype)],
         meta={},
         layer_id=0, layer_kind=LayerKind.DENSE, component=None,
     )

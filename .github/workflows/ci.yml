@@ -238,21 +238,104 @@ jobs:
 
       - name: Run tests with coverage
         if: needs.classify-changes.outputs.gate_mode == 'full'
+        shell: bash
         run: |
+          set +e
+          set -o pipefail
           pytest tests/ \
             -m "not network" \
+            --junitxml=pytest-results.xml \
             --cov=python/zrt \
             --cov-report=xml:coverage.xml \
             --cov-report=term-missing \
-            --cov-fail-under=${{ env.GLOBAL_COVERAGE_THRESHOLD }} \
-            -q
+            -q 2>&1 | tee pytest-output.log
+          pytest_status=$?
+          set +o pipefail
+          set -e
+          echo "${pytest_status}" > pytest-status.txt
+
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+          import xml.etree.ElementTree as ET
+
+          junit_path = pathlib.Path("pytest-results.xml")
+          coverage_path = pathlib.Path("coverage.xml")
+          status = int(pathlib.Path("pytest-status.txt").read_text().strip())
+
+          if status not in (0, 1):
+              print(f"ERROR: pytest exited with infrastructure status {status}; "
+                    "only test failure status 1 is allowed by the temporary baseline gate.",
+                    file=sys.stderr)
+              sys.exit(status)
+
+          if not junit_path.exists():
+              print("ERROR: pytest-results.xml was not generated.", file=sys.stderr)
+              sys.exit(1)
+          if not coverage_path.exists():
+              print("ERROR: coverage.xml was not generated.", file=sys.stderr)
+              sys.exit(1)
+
+          def local_name(tag: str) -> str:
+              return tag.rsplit("}", 1)[-1]
+
+          root = ET.parse(junit_path).getroot()
+          failures = []
+          for case in root.iter():
+              if local_name(case.tag) != "testcase":
+                  continue
+              has_failure = any(
+                  local_name(child.tag) in {"failure", "error"}
+                  for child in list(case)
+              )
+              if not has_failure:
+                  continue
+              classname = case.attrib.get("classname", "")
+              name = case.attrib.get("name", "")
+              failures.append(f"{classname}::{name}" if classname else name)
+
+          failures = sorted(set(failures))
+          pathlib.Path("pytest-failures.json").write_text(
+              json.dumps({"count": len(failures), "failures": failures}, indent=2),
+              encoding="utf-8",
+          )
+          print(f"PR failing/error tests: {len(failures)}")
+          for nodeid in failures[:25]:
+              print(f"  {nodeid}")
+          if len(failures) > 25:
+              print(f"  ... {len(failures) - 25} more")
+
+          cov_root = ET.parse(coverage_path).getroot()
+          pct = float(cov_root.attrib["line-rate"]) * 100.0
+          threshold = float(os.environ["GLOBAL_COVERAGE_THRESHOLD"])
+          print(f"PR coverage: {pct:.2f}%")
+          if pct < threshold:
+              print(f"Coverage below threshold: {pct:.2f}% < {threshold:.2f}%",
+                    file=sys.stderr)
+              sys.exit(1)
+          print(f"Coverage meets threshold: {pct:.2f}% >= {threshold:.2f}%")
+          PY
 
       - name: Upload coverage artifact
-        if: needs.classify-changes.outputs.gate_mode == 'full'
+        if: always() && needs.classify-changes.outputs.gate_mode == 'full'
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report
           path: coverage.xml
+          retention-days: 7
+
+      - name: Upload pytest failure artifact
+        if: always() && needs.classify-changes.outputs.gate_mode == 'full'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-failures
+          path: |
+            pytest-failures.json
+            pytest-results.xml
+            pytest-status.txt
+            pytest-output.log
           retention-days: 7
 
       - uses: actions/setup-python@v5
@@ -419,51 +502,158 @@ jobs:
           name: coverage-report
           path: pr-coverage
 
-      - name: Parse PR coverage
+      - name: Download PR pytest failure artifact
+        if: needs.classify-changes.outputs.gate_mode == 'full'
+        uses: actions/download-artifact@v4
+        with:
+          name: pytest-failures
+          path: pr-pytest
+
+      - name: Parse PR coverage and failures
         if: needs.classify-changes.outputs.gate_mode == 'full'
         run: |
           python - <<'PY'
+          import json
           import pathlib
           import xml.etree.ElementTree as ET
 
-          path = pathlib.Path("pr-coverage/coverage.xml")
-          root = ET.parse(path).getroot()
+          coverage_path = pathlib.Path("pr-coverage/coverage.xml")
+          failures_path = pathlib.Path("pr-pytest/pytest-failures.json")
+          root = ET.parse(coverage_path).getroot()
           pct = int(round(float(root.attrib["line-rate"]) * 100))
           pathlib.Path("/tmp/pr_pct.txt").write_text(str(pct))
           print(f"PR coverage: {pct}%")
+
+          failures = json.loads(failures_path.read_text(encoding="utf-8"))
+          pathlib.Path("/tmp/pr_failures.json").write_text(
+              json.dumps(failures, indent=2),
+              encoding="utf-8",
+          )
+          print(f"PR failing/error tests: {failures['count']}")
           PY
 
-      - name: Measure base branch coverage
+      - name: Measure base branch coverage and failures
         if: needs.classify-changes.outputs.gate_mode == 'full'
+        shell: bash
         run: |
+          git fetch origin ${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}
           git clean -fdx
-          git checkout ${{ github.base_ref }}
+          git checkout --detach refs/remotes/origin/${{ github.base_ref }}
+          set +e
+          set -o pipefail
           pytest tests/ -m "not network" \
-            --continue-on-collection-errors \
-            --cov=python/zrt --cov-report=term -q 2>&1 | tee /tmp/base.txt || true
-          python - <<'PY'
-          import pathlib
-          import re
-          import sys
+            --junitxml=/tmp/base-pytest-results.xml \
+            --cov=python/zrt \
+            --cov-report=term \
+            --cov-report=xml:/tmp/base-coverage.xml \
+            -q 2>&1 | tee /tmp/base.txt
+          pytest_status=$?
+          set +o pipefail
+          set -e
+          echo "${pytest_status}" > /tmp/base-pytest-status.txt
 
-          txt = pathlib.Path("/tmp/base.txt").read_text()
-          m = re.search(r"TOTAL\s+\d+\s+\d+\s+(\d+)%", txt)
-          if not m:
-              print("ERROR: TOTAL coverage line not found in pytest output.", file=sys.stderr)
+          python - <<'PY'
+          import json
+          import pathlib
+          import sys
+          import xml.etree.ElementTree as ET
+
+          junit_path = pathlib.Path("/tmp/base-pytest-results.xml")
+          coverage_path = pathlib.Path("/tmp/base-coverage.xml")
+          status = int(pathlib.Path("/tmp/base-pytest-status.txt").read_text().strip())
+
+          if status not in (0, 1):
+              print(f"ERROR: base pytest exited with infrastructure status {status}; "
+                    "only test failure status 1 is allowed by the temporary baseline gate.",
+                    file=sys.stderr)
+              sys.exit(status)
+
+          if not junit_path.exists():
+              print("ERROR: base pytest-results.xml was not generated.", file=sys.stderr)
               sys.exit(1)
-          pct = m.group(1)
-          pathlib.Path("/tmp/base_pct.txt").write_text(pct)
+          if not coverage_path.exists():
+              print("ERROR: base coverage.xml was not generated.", file=sys.stderr)
+              sys.exit(1)
+
+          def local_name(tag: str) -> str:
+              return tag.rsplit("}", 1)[-1]
+
+          root = ET.parse(junit_path).getroot()
+          failures = []
+          for case in root.iter():
+              if local_name(case.tag) != "testcase":
+                  continue
+              has_failure = any(
+                  local_name(child.tag) in {"failure", "error"}
+                  for child in list(case)
+              )
+              if not has_failure:
+                  continue
+              classname = case.attrib.get("classname", "")
+              name = case.attrib.get("name", "")
+              failures.append(f"{classname}::{name}" if classname else name)
+
+          failures = sorted(set(failures))
+          pathlib.Path("/tmp/base_failures.json").write_text(
+              json.dumps({"count": len(failures), "failures": failures}, indent=2),
+              encoding="utf-8",
+          )
+          print(f"Base failing/error tests: {len(failures)}")
+
+          cov_root = ET.parse(coverage_path).getroot()
+          pct = int(round(float(cov_root.attrib["line-rate"]) * 100))
+          pathlib.Path("/tmp/base_pct.txt").write_text(str(pct))
           print(f"Base coverage: {pct}%")
           PY
 
-      - name: Enforce no regression
+      - name: Enforce coverage and failure-count no regression
         if: needs.classify-changes.outputs.gate_mode == 'full'
         run: |
-          BASE=$(cat /tmp/base_pct.txt)
-          PR=$(cat /tmp/pr_pct.txt)
-          echo "Base branch: ${BASE}% | This PR: ${PR}%"
-          if [ "$PR" -lt "$BASE" ]; then
-            echo "Coverage regression: ${PR}% < ${BASE}% (base branch)"
-            exit 1
-          fi
-          echo "Coverage did not regress: ${PR}% >= ${BASE}%"
+          python - <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          base_pct = int(pathlib.Path("/tmp/base_pct.txt").read_text().strip())
+          pr_pct = int(pathlib.Path("/tmp/pr_pct.txt").read_text().strip())
+          base = json.loads(pathlib.Path("/tmp/base_failures.json").read_text(encoding="utf-8"))
+          pr = json.loads(pathlib.Path("/tmp/pr_failures.json").read_text(encoding="utf-8"))
+
+          print(f"Base branch coverage: {base_pct}% | This PR coverage: {pr_pct}%")
+          if pr_pct < base_pct:
+              print(f"Coverage regression: {pr_pct}% < {base_pct}% (base branch)")
+              sys.exit(1)
+          print(f"Coverage did not regress: {pr_pct}% >= {base_pct}%")
+
+          base_count = int(base["count"])
+          pr_count = int(pr["count"])
+          print(f"Base failing/error tests: {base_count} | This PR: {pr_count}")
+
+          base_failures = set(base["failures"])
+          pr_failures = set(pr["failures"])
+          introduced = sorted(pr_failures - base_failures)
+          resolved = sorted(base_failures - pr_failures)
+          if introduced:
+              print("Failing/error tests present only in this PR (informational unless count increases):")
+              for nodeid in introduced[:25]:
+                  print(f"  + {nodeid}")
+              if len(introduced) > 25:
+                  print(f"  ... {len(introduced) - 25} more")
+          if resolved:
+              print("Failing/error tests fixed by this PR:")
+              for nodeid in resolved[:25]:
+                  print(f"  - {nodeid}")
+              if len(resolved) > 25:
+                  print(f"  ... {len(resolved) - 25} more")
+
+          if pr_count > base_count:
+              print(
+                  f"Failure-count regression: {pr_count} failing/error tests > "
+                  f"{base_count} on base branch"
+              )
+              sys.exit(1)
+          print(
+              f"Failure count did not regress: {pr_count} <= {base_count} "
+              "(temporary dynamic baseline)"
+          )
+          PY

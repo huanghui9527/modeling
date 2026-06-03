@@ -110,31 +110,50 @@ def memory_bytes(shape: Sequence[int], dtype: DType) -> int:
 # TensorMeta
 # ─────────────────────────────────────────────────────────────────────────────
 
-@dataclass(frozen=True)
+@dataclass
 class TensorMeta:
-    """Lightweight, immutable descriptor for a single tensor.
+    """Lightweight descriptor for a single tensor.
 
-    Does not hold real data — only shape/dtype metadata.
+    ``shape`` holds the logical (pre-sharding) dimensions; ``shape_local``
+    holds the per-rank dimensions after TP/CP/EP sharding.  When
+    ``shape_local`` is ``None`` the tensor has not been sharded and
+    ``effective_shape`` returns ``shape``.
     """
-    id: str                    # stable string ID, e.g. "t42" or "op3_out0"
+    id: str
     shape: tuple[int, ...]
     dtype: DType
-    mem_bytes: int             # pre-computed: product(shape) * dtype.itemsize
+    mem_bytes: int
+    shape_local: tuple[int, ...] | None = None
+
+    @property
+    def effective_shape(self) -> tuple[int, ...]:
+        return self.shape_local if self.shape_local is not None else self.shape
+
+    def num_elements(self) -> int:
+        n = 1
+        for d in self.effective_shape:
+            n *= d
+        return n
+
+    def nbytes(self) -> int:
+        return self.num_elements() * self.dtype.bytes
 
     @classmethod
     def from_shape_dtype(cls, tensor_id: str,
-                         shape: tuple[int, ...], dtype: DType) -> "TensorMeta":
+                         shape: tuple[int, ...], dtype: DType,
+                         shape_local: tuple[int, ...] | None = None) -> "TensorMeta":
+        local = shape_local if shape_local is not None else shape
         return cls(
             id=tensor_id,
             shape=shape,
             dtype=dtype,
-            mem_bytes=memory_bytes(shape, dtype),
+            mem_bytes=memory_bytes(local, dtype),
+            shape_local=shape_local,
         )
 
     @classmethod
     def from_strings(cls, tensor_id: str,
                      shape_str: str, dtype_str: str) -> "TensorMeta":
-        """Construct from the string representations stored in op records."""
         shape = parse_shape(shape_str)
         dtype = dtype_from_torch(dtype_str) if dtype_str else DType.UNKNOWN
         return cls.from_shape_dtype(tensor_id, shape, dtype)
