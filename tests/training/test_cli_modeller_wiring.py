@@ -61,6 +61,9 @@ def test_train_hw_cli_delegates_to_graph_native_modeller(monkeypatch, capsys):
         hidden=4096,
         num_layers_full=32,
         quant=None,
+        pp_schedule="1f1b",
+        vpp_chunks=1,
+        tp_coc=None,
     )
     fwd_graph = object()
     bwd_graph = object()

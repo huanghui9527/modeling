@@ -1,4 +1,13 @@
 from pathlib import Path
+import pytest
+
+
+def _has_fastapi():
+    try:
+        import fastapi
+        return True
+    except ImportError:
+        return False
 
 
 def test_launcher_dp_formula_excludes_ep_from_rank_product():
@@ -29,12 +38,14 @@ def test_launcher_export_buttons_have_visible_click_handlers():
     assert "setActionMessage(jobId" in html
 
 
+@pytest.mark.skipif(not _has_fastapi(), reason="fastapi not installed")
 def test_artifact_routes_do_not_launch_apps_on_server_host():
     from server.main import app
 
     assert all(not route.path.endswith("/open") for route in app.routes)
 
 
+@pytest.mark.skipif(not _has_fastapi(), reason="fastapi not installed")
 def test_html_artifact_is_served_inline_for_embedded_report(tmp_path):
     from server.main import _jobs, _lock, get_job_artifact
 
@@ -98,6 +109,7 @@ def test_launcher_disables_form_estimate_until_catalogs_load():
     assert "setEstimateRunState();" in html
 
 
+@pytest.mark.skipif(not _has_fastapi(), reason="fastapi not installed")
 def test_estimate_job_returns_html_and_excel_artifacts(tmp_path):
     from server.main import EstimateRequest, _do_estimate
 

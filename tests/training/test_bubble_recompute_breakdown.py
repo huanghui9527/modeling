@@ -2,12 +2,12 @@
 
 RED→GREEN regression for:
   1. StepResult.bubble = warmup + cooldown (absolute seconds), 0 when pp=1.
-  2. StepResult.recompute_time = 0 with no recompute policy, > 0 when
+  2. StepResult.recompute_critical = 0 with no recompute policy, > 0 when
      full/partial recompute is enabled.
   3. bubble attributed OUT of compute_time:
      pipeline_time == compute_time + exposed_comm + bubble
   4. recompute attributed OUT of bwd_compute:
-     compute_time == fwd_compute + bwd_compute + recompute_time
+     compute_time == fwd_compute + bwd_compute + recompute_critical
   5. step_time identity preserved (attribution does not change totals).
 """
 
@@ -77,7 +77,7 @@ def test_recompute_time_zero_without_policy():
 
     step = pipeline_step_time(graph, model, system, strategy)
 
-    assert step.recompute_time == 0.0
+    assert step.recompute_critical == 0.0
 
 
 def test_recompute_time_positive_with_full_recompute():
@@ -87,10 +87,9 @@ def test_recompute_time_positive_with_full_recompute():
         recompute=RecomputePolicy(per_layer={"dense": {"full"}}),
     )
     graph = build_graph(model, strategy)
-
     step = pipeline_step_time(graph, model, system, strategy)
 
-    assert step.recompute_time > 0.0
+    assert step.recompute_critical > 0.0
 
 
 def test_recompute_excluded_from_bwd_compute_invariant():
@@ -105,7 +104,7 @@ def test_recompute_excluded_from_bwd_compute_invariant():
 
     # New compute decomposition: recompute is its own term, not in bwd.
     assert step.compute_time == pytest.approx(
-        step.fwd_compute + step.bwd_compute + step.recompute_time, rel=1e-6
+        step.fwd_compute + step.bwd_compute + step.recompute_critical, rel=1e-6
     )
     # Top-level step identity still holds.
     assert step.step_time == pytest.approx(
@@ -125,7 +124,7 @@ def test_pipeline_bubble_excluded_from_compute_time_invariant():
         step.compute_time + step.exposed_comm + step.bubble, rel=1e-6
     )
     assert step.compute_time == pytest.approx(
-        step.fwd_compute + step.bwd_compute + step.recompute_time, rel=1e-6
+        step.fwd_compute + step.bwd_compute + step.recompute_critical, rel=1e-6
     )
 
 
@@ -136,7 +135,7 @@ def test_recompute_raw_zero_without_policy():
 
     step = pipeline_step_time(graph, model, system, strategy)
 
-    assert step.recompute_time_raw == 0.0
+    assert step.recompute_raw_mag == 0.0
 
 
 def _moe_bottleneck_model():
@@ -173,13 +172,13 @@ def test_dense_recompute_pipeline_hidden_raw_visible():
     assert max(st.recompute for st in s_rc.per_stage) > 0.0
     # It is hidden behind the heavier MoE stage → 0 on the critical path,
     # and step_time is unchanged vs. no recompute.
-    assert s_rc.recompute_time == 0.0
+    assert s_rc.recompute_critical == 0.0
     assert s_rc.step_time == pytest.approx(s_no.step_time, rel=1e-9)
     # But the raw magnitude is visible and positive.
-    assert s_rc.recompute_time_raw > 0.0
+    assert s_rc.recompute_raw_mag > 0.0
     # Invariant still holds with the critical-path term only.
     assert s_rc.compute_time == pytest.approx(
-        s_rc.fwd_compute + s_rc.bwd_compute + s_rc.recompute_time, rel=1e-6
+        s_rc.fwd_compute + s_rc.bwd_compute + s_rc.recompute_critical, rel=1e-6
     )
 
 
@@ -200,7 +199,7 @@ def test_recompute_attribution_preserves_step_time():
     assert step.pipeline_time == pytest.approx(
         step.compute_time + step.exposed_comm + step.bubble, rel=1e-6
     )
-    assert step.recompute_time > 0.0
+    assert step.recompute_critical > 0.0
     assert step.bubble == pytest.approx(step.warmup + step.cooldown)
 
 
@@ -208,7 +207,7 @@ def test_recompute_critical_path_does_not_include_pipeline_bubble():
     """Critical recompute is actual bottleneck-stage recompute work.
 
     Pipeline schedule/bubble amplification belongs in bubble/schedule terms;
-    it must not make recompute_time exceed raw recompute work.
+    it must not make recompute_critical exceed raw recompute work.
     """
     model, system = _model(), _system()
     strategy = Strategy(
@@ -220,9 +219,9 @@ def test_recompute_critical_path_does_not_include_pipeline_bubble():
     step = pipeline_step_time(graph, model, system, strategy)
     s_bot = max(step.per_stage, key=lambda st: st.fwd + st.bwd)
 
-    assert step.recompute_time_raw > 0.0
-    assert step.recompute_time == pytest.approx(8 * s_bot.recompute)
-    assert step.recompute_time <= step.recompute_time_raw + 1e-9
+    assert step.recompute_raw_mag > 0.0
+    assert step.recompute_critical == pytest.approx(8 * s_bot.recompute)
+    assert step.recompute_critical <= step.recompute_raw_mag + 1e-9
 
 
 def test_html_export_surfaces_recompute_and_bubble():
@@ -254,11 +253,11 @@ def test_html_export_surfaces_recompute_and_bubble():
 
         # JSON-driven template: recompute/bubble data is in the DATA payload
         assert "const DATA = JSON.parse(" in html
-        assert "recompute_time_ms" in html
-        assert "recompute_time_raw_ms" in html
+        assert "recompute_critical_ms" in html
+        assert "recompute_raw_mag_ms" in html
         assert "bubble_time_ms" in html
         assert "Step Time" in html
-        assert report.recompute_time_ms > 0.0  # this config does recompute
+        assert report.recompute_critical_ms > 0.0  # this config does recompute
     finally:
         if out_dir.exists():
             shutil.rmtree(out_dir)
@@ -278,10 +277,10 @@ def test_search_report_surfaces_bubble_and_recompute():
     report = estimate(model, system, strategy)
 
     d = report_to_dict(report)
-    for key in ("bubble_time_ms", "recompute_time_ms", "recompute_time_raw_ms"):
+    for key in ("bubble_time_ms", "recompute_critical_ms", "recompute_raw_mag_ms"):
         assert key in d, f"{key} missing from report_to_dict"
     assert d["bubble_time_ms"] > 0.0
-    assert d["recompute_time_raw_ms"] > 0.0
+    assert d["recompute_raw_mag_ms"] > 0.0
 
     txt = report_summary(report)
     assert "Recompute (critical path)" in txt
@@ -317,7 +316,7 @@ def test_search_results_table_has_recompute_columns():
     report = estimate(model, system, strategy)
     df = format_results([report], [{"model": "m"}])
 
-    for col in ("compute_time_ms", "recompute_time_ms", "recompute_time_raw_ms",
+    for col in ("compute_time_ms", "recompute_critical_ms", "recompute_raw_mag_ms",
                 "bubble_time_ms", "bubble_fraction"):
         assert col in df.columns, f"{col} missing from results table"
     row = df.iloc[0]
@@ -325,4 +324,4 @@ def test_search_results_table_has_recompute_columns():
         row["compute_time_ms"] + row["exposed_comm_ms"] + row["bubble_time_ms"],
         abs=0.01,
     )
-    assert df.iloc[0]["recompute_time_raw_ms"] > 0.0
+    assert df.iloc[0]["recompute_raw_mag_ms"] > 0.0

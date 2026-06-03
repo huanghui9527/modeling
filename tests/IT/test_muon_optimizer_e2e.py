@@ -470,12 +470,12 @@ class TestOptimizerNodeMetadata:
         
         unified_graph = transformed.get("unified")
         
-        assert "pipeline_metrics" in unified_graph.metadata, \
-            "graph metadata should have 'pipeline_metrics'"
+        assert "step_result" in unified_graph.metadata, \
+            "graph metadata should have 'step_result'"
         
-        pm = unified_graph.metadata["pipeline_metrics"]
-        assert hasattr(pm, "step_time_ms") or "step_time_ms" in pm, \
-            "pipeline_metrics should have step_time_ms"
+        sr = unified_graph.metadata["step_result"]
+        assert "step_time_ms" in sr, \
+            "step_result should have step_time_ms"
 
 
 if __name__ == "__main__":

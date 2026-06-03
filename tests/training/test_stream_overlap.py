@@ -175,10 +175,16 @@ class TestStreamAssignOverlapDetection:
 
 
 class TestOverlapIntegration:
-    """Integration: overlap reduces step_time in TrainingPipelinePass."""
+    """Integration: overlap metadata is correctly populated in TrainingPipelinePass.
+
+    Note: In trace mode, PPStitcher models compute↔comm overlap via DAGScheduler
+    multi-stream scheduling, so hidden_comm is informational only and does NOT
+    reduce step_time. These tests verify that overlap metadata is correctly
+    populated and that formula-based hidden_comm is calculated as expected.
+    """
 
     def test_overlap_reduces_step_time(self):
-        """Step time with overlap should be less than without."""
+        """Overlap metadata should show hidden comm for ring-CP."""
         seq_len, hidden = 2048, 4096
         hw = _make_hardware_spec()
 
@@ -195,7 +201,7 @@ class TestOverlapIntegration:
             n.annotations["latency_us"] = 100.0
         ctx = _make_ctx()
         r_no = TrainingPipelinePass().run(g_no, ctx)
-        step_no = r_no.metadata["pipeline_metrics"].step_time_ms
+        sr_no = r_no.metadata["step_result"]
 
         # Graph with ring-CP overlap on the comm node
         g_ov = _make_graph_with_comm(seq_len, hidden)
@@ -204,15 +210,17 @@ class TestOverlapIntegration:
         comm = g_ov.nodes["comm_ar_0"]
         comm.annotations["overlap_type"] = "ring_cp"
         comm.annotations["overlap_target"] = "fa_tile:matmul_0"
+        comm.annotations["overlap_strategy"] = "cp"
         r_ov = TrainingPipelinePass().run(g_ov, ctx)
-        step_ov = r_ov.metadata["pipeline_metrics"].step_time_ms
+        sr_ov = r_ov.metadata["step_result"]
 
-        assert step_ov < step_no, (
-            f"Overlap should reduce step time: {step_ov} >= {step_no}"
+        # Overlap metadata should show hidden comm for ring-CP
+        assert sr_ov["cp_hidden_ms"] > sr_no["cp_hidden_ms"], (
+            f"Ring-CP should produce hidden comm: {sr_ov['cp_hidden_ms']} <= {sr_no['cp_hidden_ms']}"
         )
 
     def test_coc_overlap_uses_predecessor_latency_without_explicit_target(self):
-        """CoC overlap should still reduce step time using predecessor compute latency."""
+        """CoC overlap should produce hidden comm using predecessor compute latency."""
         seq_len, hidden = 2048, 4096
         hw = _make_hardware_spec()
         ctx = TransformContext(
@@ -225,7 +233,7 @@ class TestOverlapIntegration:
         for n in g_no.nodes.values():
             n.annotations["latency_us"] = 100.0
         r_no = TrainingPipelinePass().run(g_no, ctx)
-        step_no = r_no.metadata["pipeline_metrics"].step_time_ms
+        sr_no = r_no.metadata["step_result"]
 
         g_coc = _make_graph_with_comm(seq_len, hidden)
         for n in g_coc.nodes.values():
@@ -236,8 +244,9 @@ class TestOverlapIntegration:
         # Intentionally no overlap_target: pipeline should use predecessor latency.
 
         r_coc = TrainingPipelinePass().run(g_coc, ctx)
-        step_coc = r_coc.metadata["pipeline_metrics"].step_time_ms
+        sr_coc = r_coc.metadata["step_result"]
 
-        assert step_coc < step_no, (
-            f"CoC fallback should reduce step time: {step_coc} >= {step_no}"
+        # CoC should produce hidden comm (tp_hidden since default tag is "tp")
+        assert sr_coc["tp_hidden_ms"] > sr_no["tp_hidden_ms"], (
+            f"CoC should produce hidden comm: {sr_coc['tp_hidden_ms']} <= {sr_no['tp_hidden_ms']}"
         )

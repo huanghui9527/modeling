@@ -2,7 +2,7 @@
 import pytest
 from unittest.mock import MagicMock, patch
 
-from python.zrt.transform.analysis.training import TrainingMemoryPass, TrainingMemoryBreakdown
+from zrt.transform.analysis.training import TrainingMemoryPass, TrainingMemoryBreakdown
 
 
 def _make_graph_and_ctx(num_layers=61, num_layers_traced=4):
@@ -25,6 +25,7 @@ def _make_graph_and_ctx(num_layers=61, num_layers_traced=4):
     ctx.training = None
     ctx.hw_spec = None
     ctx.is_training = True
+    ctx.quant_profile = None
     return g, ctx
 
 
@@ -35,7 +36,7 @@ def test_memory_pass_layer_scale():
     """
     g, ctx = _make_graph_and_ctx(num_layers=61, num_layers_traced=4)
 
-    with patch("python.zrt.transform.analysis.training.count_params") as mock_count:
+    with patch("zrt.transform.analysis.training.count_params") as mock_count:
         # Simulate: traced 4 layers = 100M params
         mock_count.return_value = 100_000_000
 
@@ -56,7 +57,7 @@ def test_memory_pass_no_scale_when_full_model():
     """When num_layers == num_layers_traced, no scaling should occur."""
     g, ctx = _make_graph_and_ctx(num_layers=4, num_layers_traced=4)
 
-    with patch("python.zrt.transform.analysis.training.count_params") as mock_count:
+    with patch("zrt.transform.analysis.training.count_params") as mock_count:
         mock_count.return_value = 100_000_000
 
         result = TrainingMemoryPass().run(g, ctx)
@@ -73,7 +74,7 @@ def test_memory_pass_uses_metadata_dtype():
     g, ctx = _make_graph_and_ctx(num_layers=4, num_layers_traced=4)
     g.metadata["param_dtype_bytes"] = 1  # FP8
 
-    with patch("python.zrt.transform.analysis.training.count_params") as mock_count:
+    with patch("zrt.transform.analysis.training.count_params") as mock_count:
         mock_count.return_value = 100_000_000
 
         result = TrainingMemoryPass().run(g, ctx)
@@ -88,7 +89,7 @@ def test_memory_pass_grad_scaling():
     """Gradient memory should also be scaled by layer_scale."""
     g, ctx = _make_graph_and_ctx(num_layers=61, num_layers_traced=4)
 
-    with patch("python.zrt.transform.analysis.training.count_params") as mock_count:
+    with patch("zrt.transform.analysis.training.count_params") as mock_count:
         mock_count.return_value = 100_000_000
 
         result = TrainingMemoryPass().run(g, ctx)

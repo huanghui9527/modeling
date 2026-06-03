@@ -653,7 +653,7 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
     fusion_cfg = _resolve_fusion_config(args, model_id, phase="training")
     
     # Extract LayerProfile from graph metadata if available
-    layer_profile = raw_fwd.metadata.get("layer_profile", None)
+    layer_profile = getattr(raw_fwd, "metadata", {}).get("layer_profile", None)
     
     report, ctx, transformed = estimate_training_from_graphs(
         forward_graph=raw_fwd,

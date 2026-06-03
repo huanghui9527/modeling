@@ -733,7 +733,7 @@ class TestTrainingPipelinePassPerStage:
         g_pp = PipelineParallelPass().run(graph, ctx) if pp > 1 else graph
         g_flops = TrainingFlopsPass().run(g_pp, ctx)
         result = TrainingPipelinePass().run(g_flops, ctx)
-        return result, result.metadata["pipeline_metrics"]
+        return result, result.metadata["step_result"]
 
     def test_pp1_no_bubble(self):
         from python.zrt.transform.analysis.training import TrainingFlopsPass
@@ -743,17 +743,17 @@ class TestTrainingPipelinePassPerStage:
 
         g_flops = TrainingFlopsPass().run(graph, ctx)
         result = TrainingPipelinePass().run(g_flops, ctx)
-        metrics = result.metadata["pipeline_metrics"]
+        metrics = result.metadata["step_result"]
 
-        assert metrics.warmup_steps == 0
-        assert metrics.cooldown_steps == 0
-        assert metrics.bubble_fraction == 0.0
+        assert metrics["warmup_steps"] == 0
+        assert metrics["cooldown_steps"] == 0
+        assert metrics["bubble_fraction"] == 0.0
 
     def test_pp2_has_bubble(self):
         _, metrics = self._run_pipeline_pass(pp=2, global_batch=8)
-        assert metrics.warmup_steps == 1
-        assert metrics.cooldown_steps == 1
-        assert metrics.bubble_fraction > 0.0
+        assert metrics["warmup_steps"] == 1
+        assert metrics["cooldown_steps"] == 1
+        assert metrics["bubble_fraction"] > 0.0
 
     def test_per_stage_latency_not_divided_by_pp(self):
         from python.zrt.transform.analysis.training import TrainingFlopsPass
@@ -765,11 +765,11 @@ class TestTrainingPipelinePassPerStage:
         g_pp2 = PipelineParallelPass().run(graph, ctx2)
         g_pp2 = TrainingFlopsPass().run(g_pp2, ctx2)
         result2 = TrainingPipelinePass().run(g_pp2, ctx2)
-        per_stage_pp2 = result2.metadata["pipeline_metrics"].per_stage_ms
+        per_stage_pp2 = result2.metadata["step_result"]["per_stage_ms"]
 
         g1 = TrainingFlopsPass().run(graph, ctx1)
         result1 = TrainingPipelinePass().run(g1, ctx1)
-        total_pp1 = result1.metadata["pipeline_metrics"].per_stage_ms
+        total_pp1 = result1.metadata["step_result"]["per_stage_ms"]
 
         assert 0 < per_stage_pp2 <= total_pp1 * 1.1
 
@@ -791,7 +791,7 @@ class TestTrainingPipelinePassPerStage:
             g = PipelineParallelPass().run(graph, ctx) if pp > 1 else graph
             g = TrainingFlopsPass().run(g, ctx)
             r = TrainingPipelinePass().run(g, ctx)
-            results[pp] = r.metadata["pipeline_metrics"].bubble_fraction
+            results[pp] = r.metadata["step_result"]["bubble_fraction"]
 
         assert results[1] == 0.0
         assert results[2] > results[1]
@@ -815,8 +815,8 @@ class TestTrainingPipelinePassPerStage:
         g_std = TrainingFlopsPass().run(g_pp_std, ctx_std)
         result_std = TrainingPipelinePass().run(g_std, ctx_std)
 
-        bubble_vpp = result_vpp.metadata["pipeline_metrics"].bubble_fraction
-        bubble_std = result_std.metadata["pipeline_metrics"].bubble_fraction
+        bubble_vpp = result_vpp.metadata["step_result"]["bubble_fraction"]
+        bubble_std = result_std.metadata["step_result"]["bubble_fraction"]
 
         assert bubble_vpp <= bubble_std + 1e-6
 

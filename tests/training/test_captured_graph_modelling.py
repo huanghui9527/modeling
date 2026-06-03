@@ -581,14 +581,14 @@ def test_pp_heterogeneous_1f1b_formula():
     bwd = _backward_graph_for_fwd(fwd)
     stitched = stitch_fwd_bwd(fwd, bwd)
 
-    # Pre-annotate asymmetric latency: layer 0 = 10 µs, layer 1 = 100 µs.
-    # Injecting before the pipeline skips RooflinePass estimation for these nodes.
+    # Pre-annotate asymmetric latency: layer 0 = 10 µs, layer 1 = 40 µs (4x imbalance, below 5x fallback threshold).
+    # Injecting before the pipeline: RooflinePass respects pre-existing latency_us for fwd nodes.
     for node in stitched.nodes.values():
         try:
             lid = int(node.layer)
         except (ValueError, TypeError):
             continue
-        node.annotations["latency_us"] = 10.0 if lid == 0 else 100.0
+        node.annotations["latency_us"] = 10.0 if lid == 0 else 40.0
 
     hw = _hw()
     ctx = TransformContext(

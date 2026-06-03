@@ -79,6 +79,7 @@ class TestMatMul:
             "aten.mm.default",
             [_tm("a", (M, K), DType.FP8_E4M3), _tm("b", (K, N), DType.FP8_E4M3)],
             [_tm("c", (M, N), DType.FP8_E4M3)],
+            annotations={"quant.weight": DType.FP8_E4M3},
         )
         assert flops == 2.0 * M * K * N
         assert r == (M * K + K * N) * b

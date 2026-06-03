@@ -181,9 +181,9 @@ def test_step_time_matches_1f1b_formula():
         MockSched.return_value.schedule.return_value = mock_timeline
         result = TrainingPipelinePass().run(g, ctx)
 
-    metrics = result.metadata["pipeline_metrics"]
+    metrics = result.metadata["step_result"]
     expected_step_ms = (M + pp - 1) * per_stage_us / 1000.0
-    assert metrics.step_time_ms == pytest.approx(expected_step_ms, rel=0.01)
+    assert metrics["step_time_ms"] == pytest.approx(expected_step_ms, rel=0.01)
 
 
 def test_bubble_fraction_correct():
@@ -207,9 +207,9 @@ def test_bubble_fraction_correct():
         MockSched.return_value.schedule.return_value = mock_timeline
         result = TrainingPipelinePass().run(g, ctx)
 
-    metrics = result.metadata["pipeline_metrics"]
+    metrics = result.metadata["step_result"]
     expected_bubble = (pp - 1) / (M + pp - 1)
-    assert metrics.bubble_fraction == pytest.approx(expected_bubble, abs=0.01)
+    assert metrics["bubble_fraction"] == pytest.approx(expected_bubble, abs=0.01)
 
 
 def test_steady_steps_equals_num_microbatches():
@@ -233,10 +233,10 @@ def test_steady_steps_equals_num_microbatches():
         MockSched.return_value.schedule.return_value = mock_timeline
         result = TrainingPipelinePass().run(g, ctx)
 
-    metrics = result.metadata["pipeline_metrics"]
-    assert metrics.steady_steps == M
-    assert metrics.warmup_steps == pp - 1
-    assert metrics.cooldown_steps == pp - 1
+    metrics = result.metadata["step_result"]
+    assert metrics["steady_steps"] == M
+    assert metrics["warmup_steps"] == pp - 1
+    assert metrics["cooldown_steps"] == pp - 1
 
 
 # ── Bug 3: FlopsPass gates _calculate_grad_flops on node phase ───────────
@@ -290,10 +290,10 @@ def test_recompute_compute_time_excludes_comm_nodes_defensively():
         result = TrainingPipelinePass().run(g, ctx)
 
     assert result.metadata["recompute_compute_ms"] == pytest.approx(0.15)
-    metrics = result.metadata["pipeline_metrics"]
-    assert metrics.fwd_compute_ms == 0.0
-    assert metrics.bwd_compute_ms == 0.0
-    assert metrics.compute_time_ms == pytest.approx(metrics.recompute_compute_ms)
+    metrics = result.metadata["step_result"]
+    assert metrics["fwd_compute_ms"] == 0.0
+    assert metrics["bwd_compute_ms"] == 0.0
+    assert metrics["compute_time_ms"] == pytest.approx(metrics["recompute_compute_ms"])
 
 
 def test_train_flops_pass_zeros_dx_dw_for_backward_phase_nodes():

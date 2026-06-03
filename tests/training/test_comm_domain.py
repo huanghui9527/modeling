@@ -214,13 +214,14 @@ def test_optimizer_comm_time_accepts_shared_domain():
     assert res_with["muon_ag"] > 0  # ZeRO-1 Muon → real cost
 
 
-def test_expert_dp_group_size_rejects_non_divisible_dp_ep():
+def test_expert_dp_group_size_handles_non_divisible_dp_ep():
+    """When dp % ep != 0, group_size returns max(1, dp // ep)."""
     sys = _three_tier_system(world_size=512)
     s = Strategy(tp=1, cp=1, ep=384, dp=512, pp=1)
     d = CommDomain(system=sys, strategy=s)
 
-    with pytest.raises(ValueError, match="dp must be divisible by ep"):
-        d.group_size("EXPERT_DP")
+    # dp=512, ep=384 → 512 // 384 = 1 → max(1, 1) = 1
+    assert d.group_size("EXPERT_DP") == 1
 
 
 def test_n_tier_time_uses_max_group_instance_not_rank0_only():

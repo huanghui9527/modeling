@@ -561,9 +561,8 @@ class TestExpertDPValidation:
             gpus_per_node=8,
         )
         strategy = Strategy(tp=1, cp=1, pp=1, ep=384, dp=512)
-
-        with pytest.raises(ValueError, match="dp must be divisible by ep"):
-            strategy.validate(model, system)
+        # No longer raises; dp % ep != 0 is handled gracefully
+        strategy.validate(model, system)
 
     def test_valid_ep_dp_pairs_still_validate(self):
         model = _make_moe_model(num_experts=64)
@@ -572,22 +571,24 @@ class TestExpertDPValidation:
         Strategy(tp=8, cp=1, pp=1, ep=2, dp=8).validate(model, system)
         Strategy(tp=8, cp=1, pp=1, ep=8, dp=8).validate(model, system)
 
-    def test_muon_arch_flops_rejects_non_regular_ep_dp(self):
+    def test_muon_arch_flops_handles_non_regular_ep_dp(self):
         model = _make_moe_model(num_experts=64)
         strategy = Strategy(tp=1, cp=1, pp=1, ep=8, dp=1, optimizer=OptKind.MUON)
 
-        with pytest.raises(ValueError, match="dp must be >= ep"):
-            muon_step_flops_from_arch(model, strategy, K=5)
+        # No longer raises; dp < ep is handled gracefully with max(1, dp // ep)
+        flops = muon_step_flops_from_arch(model, strategy, K=5)
+        assert flops > 0
 
-    def test_optimizer_compute_rejects_non_regular_ep_dp_for_adam(self):
+    def test_optimizer_compute_handles_non_regular_ep_dp_for_adam(self):
         model = _make_moe_model(num_experts=64)
         system = _make_mock_system()
         strategy = Strategy(tp=1, cp=1, pp=1, ep=8, dp=1, optimizer=OptKind.ADAM)
 
         from zrt.training.compose.schedules import _compute_optimizer_time
 
-        with pytest.raises(ValueError, match="dp must be >= ep"):
-            _compute_optimizer_time(model, system, strategy)
+        # No longer raises; dp < ep is handled gracefully
+        time_us = _compute_optimizer_time(model, system, strategy)
+        assert time_us >= 0
 
 
 def _make_moe_model(num_experts: int = 64) -> ModelSpec:

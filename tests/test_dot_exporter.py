@@ -51,28 +51,28 @@ class TestExportDot:
     def test_dot_valid_syntax(self, tmp_path: Path):
         g = _make_graph()
         dot = export_dot(g, tmp_path / "out.dot")
-        text = dot.read_text()
+        text = dot.read_text(encoding="utf-8")
         assert "digraph {" in text
         assert "subgraph cluster_" in text
         assert "->" in text
 
     def test_cluster_count_matches_layers(self, tmp_path: Path):
         g = _make_graph()
-        text = export_dot(g, tmp_path / "out.dot").read_text()
+        text = export_dot(g, tmp_path / "out.dot").read_text(encoding="utf-8")
         # layers: "0", "1", and __other__ → 3 clusters
         clusters = re.findall(r"subgraph (cluster_\w+)", text)
         assert len(clusters) == 3
 
     def test_node_count_matches_graph(self, tmp_path: Path):
         g = _make_graph()
-        text = export_dot(g, tmp_path / "out.dot").read_text()
+        text = export_dot(g, tmp_path / "out.dot").read_text(encoding="utf-8")
         # Each node appears as "node_id" [label=...
         for nid in g.nodes:
             assert f'"{nid}"' in text
 
     def test_category_colors(self, tmp_path: Path):
         g = _make_graph()
-        text = export_dot(g, tmp_path / "out.dot").read_text()
+        text = export_dot(g, tmp_path / "out.dot").read_text(encoding="utf-8")
         assert "#4A90D9" in text   # compute
         assert "#E05252" in text   # communication
         assert "#E09A52" in text   # memory
@@ -80,7 +80,7 @@ class TestExportDot:
     def test_empty_graph_no_crash(self, tmp_path: Path):
         g = OpGraph(name="empty", phase="forward")
         dot = export_dot(g, tmp_path / "empty.dot")
-        text = dot.read_text()
+        text = dot.read_text(encoding="utf-8")
         assert "digraph {" in text
         assert text.count("subgraph") == 0  # no clusters for empty graph
 
@@ -107,5 +107,5 @@ class TestGraphDumpPass:
         assert result is g
         # DOT file created
         assert (tmp_path / "test_dump.dot").exists()
-        text = (tmp_path / "test_dump.dot").read_text()
+        text = (tmp_path / "test_dump.dot").read_text(encoding="utf-8")
         assert "digraph {" in text

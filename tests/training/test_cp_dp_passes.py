@@ -264,8 +264,8 @@ def test_pipeline_pass_dp_in_bubble_adds_exposed_time():
 
     # With dp_overlap=True, composer hides DP AR in bubble → less step time.
     # With dp_overlap=False, full DP AR is added → more step time.
-    assert (result_overlap.metadata["pipeline_metrics"].step_time_ms <=
-            result_no_overlap.metadata["pipeline_metrics"].step_time_ms)
+    assert (result_overlap.metadata["step_result"]["step_time_ms"] <=
+            result_no_overlap.metadata["step_result"]["step_time_ms"])
 
 
 def test_pipeline_pass_dp_in_bubble_no_penalty_when_ar_fits():
@@ -309,5 +309,5 @@ def test_pipeline_pass_dp_in_bubble_no_penalty_when_ar_fits():
         r_on = TrainingPipelinePass().run(g, ctx)
         r_off = TrainingPipelinePass().run(g, ctx_no)
 
-    assert (r_on.metadata["pipeline_metrics"].step_time_ms ==
-            pytest.approx(r_off.metadata["pipeline_metrics"].step_time_ms, rel=0.01))
+    assert (r_on.metadata["step_result"]["step_time_ms"] ==
+            pytest.approx(r_off.metadata["step_result"]["step_time_ms"], rel=0.01))

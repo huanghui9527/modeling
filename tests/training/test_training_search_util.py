@@ -1001,7 +1001,7 @@ class TestBestAnalysisReport:
             "tokens_per_sec": 150.0,
             "fwd_compute_ms": 20.0,
             "bwd_compute_ms": 30.0,
-            "recompute_time_ms": 10.0,
+            "recompute_critical_ms": 10.0,
             "tp_exposed_ms": 2.0,
             "ep_exposed_ms": 3.0,
             "pp_exposed_ms": 4.0,

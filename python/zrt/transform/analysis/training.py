@@ -1655,13 +1655,8 @@ def compute_exposed_comm_time(
     if overlap_type == "mc2":
         return 0.0
     elif overlap_type == "coc":
-        gemm_tile = target_latency_us / coc_tile_k if coc_tile_k > 0 else 0.0
-        comm_tile = comm_latency_us / coc_tile_k if coc_tile_k > 0 else 0.0
-        if gemm_tile >= comm_tile:
-            exposed = comm_tile
-        else:
-            exposed = comm_latency_us - target_latency_us * (coc_tile_k - 1) / coc_tile_k
-        return max(0.0, exposed)
+        overlap_window = target_latency_us * (coc_tile_k - 1) / coc_tile_k if coc_tile_k > 0 else 0.0
+        return max(0.0, comm_latency_us - overlap_window)
     elif overlap_type == "ring_cp":
         fa_tile_latency = target_latency_us / cp_rounds if cp_rounds > 1 else target_latency_us
         p2p_round_latency = comm_latency_us / cp_rounds if cp_rounds > 1 else comm_latency_us

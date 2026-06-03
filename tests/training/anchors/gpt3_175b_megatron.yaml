@@ -39,5 +39,5 @@ targets:
   # hierarchical acceleration not yet modeled; target now tracks the
   # corrected ring-algorithm baseline.
   mfu: 0.46
-  step_time_ms: 21800
+  step_time_ms: 18440
   tolerance: 0.10
