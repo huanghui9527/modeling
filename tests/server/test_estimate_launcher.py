@@ -1,13 +1,10 @@
 from pathlib import Path
+import importlib.util
 import pytest
 
 
 def _has_fastapi():
-    try:
-        import fastapi
-        return True
-    except ImportError:
-        return False
+    return importlib.util.find_spec("fastapi") is not None
 
 
 def test_launcher_dp_formula_excludes_ep_from_rank_product():

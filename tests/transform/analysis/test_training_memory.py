@@ -2,7 +2,7 @@
 import pytest
 from unittest.mock import MagicMock, patch
 
-from zrt.transform.analysis.training import TrainingMemoryPass, TrainingMemoryBreakdown
+from zrt.transform.analysis.training import TrainingMemoryPass
 
 
 def _make_graph_and_ctx(num_layers=61, num_layers_traced=4):
