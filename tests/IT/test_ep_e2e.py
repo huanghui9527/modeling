@@ -213,7 +213,8 @@ class TestEPE2E:
     def test_grouped_mm_exists(self, ep8_all):
         _, _, t = ep8_all
         grouped = [n for n in t["unified"].nodes.values() if n.op_type == "GroupedMatMul"]
-        assert len(grouped) >= 4, f"Expected >= 4 GroupedMM, got {len(grouped)}"
+        # DSv4: only 1 MoE layer in first 4 layers → 4 GroupedMatMul (1 layer × 4 roles)
+        assert len(grouped) == 4, f"Expected 4 GroupedMM, got {len(grouped)}"
 
     def test_grouped_mm_per_moe_layer(self, ep8_all):
         _, _, t = ep8_all
@@ -222,11 +223,13 @@ class TestEPE2E:
         for node in grouped:
             role = node.annotations.get("grouped_mm_role")
             role_counts[role] = role_counts.get(role, 0) + 1
-        # At least 1 of each role (forward + backward)
-        assert role_counts.get("gate_up", 0) >= 1
-        assert role_counts.get("down", 0) >= 1
-        assert role_counts.get("down_bwd", 0) >= 1
-        assert role_counts.get("gate_up_bwd", 0) >= 1
+        # DSv4: 1 MoE layer → 1 of each role (fwd: gate_up+down, bwd: down_bwd+gate_up_bwd)
+        assert role_counts == {
+            "gate_up": 1,
+            "down": 1,
+            "down_bwd": 1,
+            "gate_up_bwd": 1,
+        }
 
     def test_grouped_mm_replaces_routed_experts(self, ep8_all):
         _, _, t = ep8_all
@@ -250,12 +253,18 @@ class TestEPE2E:
 
     def test_grouped_mm_token_count(self, ep8_all):
         _, _, t = ep8_all
+        # M = ceil(tokens_per_ep_rank / experts_per_rank)
+        # tokens_per_ep_rank = batch * seq * topk = 1 * 128 * 48 = 6144
+        # experts_per_rank = 384 / 8 = 48
+        # M = ceil(6144 / 48) = 128
+        experts_per_rank = _NUM_EXPERTS // _EP
+        tokens_per_ep_rank = _BATCH * _SEQ_LEN * _MOE_ACTIVE
+        expected_M = (tokens_per_ep_rank + experts_per_rank - 1) // experts_per_rank
         for n in t["unified"].nodes.values():
             if n.op_type == "GroupedMatMul":
-                M = n.inputs[0].shape[1]
-                assert M > 0
-                assert M <= _BATCH * _SEQ_LEN
-                break
+                assert n.inputs[0].shape[1] == expected_M, (
+                    f"Expected M={expected_M}, got {n.inputs[0].shape[1]}"
+                )
 
     def test_grouped_mm_shapes_match_dsv4_experts(self, ep8_all):
         _, _, t = ep8_all
@@ -421,15 +430,20 @@ class TestEPE2E:
         rows = _sheet_rows(ep8_artifacts["excel"], "Forward Operators")
         grouped = {str(r["Node ID"]): r for r in rows if r["Op Type"] == "GroupedMatMul"}
         G = _NUM_EXPERTS // _EP
-        # Extract M from actual gate_up input shapes
+        # DSv4: only 1 MoE layer (layer 0 in captured graph) has GroupedMatMul
         prefix = "transformer_layers_0_ffn"
         gate_up = grouped[f"{prefix}_grouped_gate_up"]
         down = grouped[f"{prefix}_grouped_down"]
+        # Extract M from actual gate_up input shapes
         input_shapes = str(gate_up["Input Shapes"])
-        # Parse M from first tuple: "(G, M, hidden)"
         first_tuple = input_shapes.split(")")[0] + ")"
         parts = [x.strip() for x in first_tuple.strip("()").split(",")]
         M = int(parts[1])
+        # Verify M matches formula: ceil(batch * seq * topk / experts_per_rank)
+        experts_per_rank = _NUM_EXPERTS // _EP
+        tokens_per_ep_rank = _BATCH * _SEQ_LEN * _MOE_ACTIVE
+        expected_M = (tokens_per_ep_rank + experts_per_rank - 1) // experts_per_rank
+        assert M == expected_M, f"Excel M={M} != expected {expected_M}"
         assert str((G, M, _HIDDEN)) in str(gate_up["Input Shapes"])
         assert str((G, _HIDDEN, _MOE_INTERMEDIATE * 2)) in str(gate_up["Input Shapes"])
         assert str((G, M, _MOE_INTERMEDIATE * 2)) in str(gate_up["Output Shapes"])
@@ -442,7 +456,7 @@ class TestEPE2E:
         ids = [str(r["Node ID"]) for r in rows]
         grouped = {str(r["Node ID"]): r for r in rows if r["Op Type"] == "GroupedMatMul"}
         G = _NUM_EXPERTS // _EP
-        # Check at least layer 0 exists
+        # DSv4: only 1 MoE layer (layer 0 in captured graph) has GroupedMatMul
         prefix = "transformer_layers_0_ffn"
         expected = [
             f"comm_a2a_dispatch_{prefix}_grouped_down_bwd",
@@ -459,6 +473,11 @@ class TestEPE2E:
         first_tuple = input_shapes.split(")")[0] + ")"
         parts = [x.strip() for x in first_tuple.strip("()").split(",")]
         M = int(parts[1])
+        # Verify M matches formula
+        experts_per_rank = _NUM_EXPERTS // _EP
+        tokens_per_ep_rank = _BATCH * _SEQ_LEN * _MOE_ACTIVE
+        expected_M = (tokens_per_ep_rank + experts_per_rank - 1) // experts_per_rank
+        assert M == expected_M, f"Excel bwd M={M} != expected {expected_M}"
         assert str((G, M, _HIDDEN)) in str(down["Input Shapes"])
         assert str((G, _HIDDEN, _MOE_INTERMEDIATE)) in str(down["Input Shapes"])
         assert str((G, M, _MOE_INTERMEDIATE)) in str(down["Output Shapes"])
@@ -477,7 +496,7 @@ class TestEPE2E:
             )
         ]
         ids = [str(r["Node ID"]) for r in fwd_ep]
-        # Check at least layer 0 exists
+        # DSv4: only 1 MoE layer (layer 0 in captured graph)
         prefix = "transformer_layers_0_ffn"
         expected = [
             f"comm_a2a_dispatch_{prefix}_grouped_gate_up",

@@ -243,7 +243,10 @@ _FP8_FP4_B300_ANCHOR = ANCHOR_DIR / "deepseek_v4_pro_fp8_fp4_b300.yaml"
 _BF16_BASELINE_ANCHOR = ANCHOR_DIR / "deepseek_v4_pro.yaml"
 
 
-@pytest.mark.skip(reason="quant preset doesn't yet reduce compute time in simulator; FP8/FP4 slightly slower due to comm overhead")
+@pytest.mark.xfail(
+    reason="quant preset 未实现 compute time 优化，FP8/FP4 可能略慢于 BF16（通信开销），see Issue #215",
+    strict=False,
+)
 def test_anchor_fp8_fp4_h100_faster_than_bf16():
     """V4-Pro FP8+FP4 path should be measurably faster than BF16 baseline.
 

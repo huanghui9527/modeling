@@ -68,8 +68,9 @@ def get_model_graphs():
 
     assert fwd is not None, "train_forward graph must be captured"
     assert bwd is not None, "train_backward graph must be captured"
-    assert len(fwd.nodes) > 100, f"Expected >100 forward nodes, got {len(fwd.nodes)}"
-    assert len(bwd.nodes) > 100, f"Expected >100 backward nodes, got {len(bwd.nodes)}"
+    # DSv4 first 4 layers: 3 dense + 1 MoE → ~309 fwd nodes, ~559 bwd nodes
+    assert len(fwd.nodes) > 200, f"Expected >200 forward nodes, got {len(fwd.nodes)}"
+    assert len(bwd.nodes) > 400, f"Expected >400 backward nodes, got {len(bwd.nodes)}"
 
     return {
         "forward": fwd,
@@ -234,61 +235,63 @@ class TestPPScheduleTheoryValidation:
         """1F1B bubble ≈ 1/(8+2-1) = 1/9 = 0.111111111.
 
         【原理】1F1B bubble 公式: bubble = (pp-1) / (num_micro_batches + pp - 1)
-        【观测点】bubble_fraction ≈ 1/9（允许5%误差）
+        【观测点】bubble_fraction ≈ 1/9（rel=0.01，含 step_time 计算开销）
         """
         r = _get_report(cached_reports, "1f1b")
         expected_bubble = 1.0 / 9.0
-        assert r.bubble_fraction == pytest.approx(expected_bubble, rel=0.05), \
+        assert r.bubble_fraction == pytest.approx(expected_bubble, rel=0.01), \
             f"1F1B bubble {r.bubble_fraction} != 1/9 = {expected_bubble}"
 
     def test_vpp_bubble_equals_one_over_seventeen(self, cached_reports):
         """VPP (vpp_chunks=2) bubble ≈ 1/(8*2+2-1) = 1/17 = 0.058823529.
 
         【原理】VPP bubble 公式: bubble = (pp-1) / (num_micro_batches * vpp_chunks + pp - 1)
-        【观测点】bubble_fraction ≈ 1/17（允许5%误差）
+        【观测点】bubble_fraction ≈ 1/17（rel=0.02，含 step_time 计算开销）
         """
         r = _get_report(cached_reports, "interleaved", 2)
         expected_bubble = 1.0 / 17.0
-        assert r.bubble_fraction == pytest.approx(expected_bubble, rel=0.05), \
+        assert r.bubble_fraction == pytest.approx(expected_bubble, rel=0.02), \
             f"VPP bubble {r.bubble_fraction} != 1/17 = {expected_bubble}"
 
     def test_dualpipe_bubble_equals_zero_at_pp2(self, cached_reports):
-        """DualPipe bubble ≈ 0 when pp=2 (near-perfect F/B overlap).
+        """DualPipe bubble at pp=2.
 
-        【原理】DualPipe 公式: slots = pp/2-1, pp=2 时 slots=0 → bubble≈0
-        【观测点】bubble_fraction < 0.15
+        【原理】DualPipe 理论 bubble=0 when pp=2 (slots=0)，但 trace mode 下
+                  homogeneous fallback 导致 fwd/bwd 不对称，bubble 非零。
+        【观测点】bubble_fraction < 0.15（trace mode 上限）
         """
         r = _get_report(cached_reports, "dualpipe")
         assert r.bubble_fraction < 0.15, \
-            f"DualPipe bubble {r.bubble_fraction} should be < 0.15 (pp=2 near-perfect overlap)"
+            f"DualPipe bubble {r.bubble_fraction} should be < 0.15 (pp=2, trace mode)"
 
     def test_dualpipev_bubble_equals_zero_at_pp2(self, cached_reports):
-        """DualPipeV bubble ≈ 0 when pp=2 (near-perfect F/B overlap).
+        """DualPipeV bubble at pp=2.
 
-        【原理】DualPipeV 公式: slots/V = (pp/2-1)/V, pp=2 时 slots=0 → bubble≈0
-        【观测点】bubble_fraction < 0.25
+        【原理】DualPipeV 理论 bubble=0 when pp=2 (slots=0)，但 trace mode 下
+                  homogeneous fallback + VPP 开销导致 bubble 非零。
+        【观测点】bubble_fraction < 0.25（trace mode + VPP 开销上限）
         """
         r = _get_report(cached_reports, "dualpipev", 2)
         assert r.bubble_fraction < 0.25, \
-            f"DualPipeV bubble {r.bubble_fraction} should be < 0.25 (pp=2 near-perfect overlap)"
+            f"DualPipeV bubble {r.bubble_fraction} should be < 0.25 (pp=2, trace mode + VPP)"
 
 
 class TestPPScheduleRelativeComparison:
     """Verify relative ordering between schedules based on theoretical properties."""
 
     def test_step_time_dualpipe_no_worse_than_1f1b(self, cached_reports):
-        """DualPipe step_time ≈ 1F1B at pp=2 (within 5%).
+        """DualPipe step_time <= 1F1B (bubble reduction → step_time reduction).
 
-        【原理】DualPipe bubble ≤ 1F1B bubble → step_time 应相近或更优
-        【观测点】dualpipe.step_time <= 1f1b.step_time * 1.05
+        【原理】DualPipe bubble ≤ 1F1B bubble → step_time 应不劣于 1F1B
+        【观测点】dualpipe.step_time <= 1f1b.step_time
         """
         r_1f1b = _get_report(cached_reports, "1f1b")
         r_vpp = _get_report(cached_reports, "interleaved", 2)
         r_dp = _get_report(cached_reports, "dualpipe")
         r_dpv = _get_report(cached_reports, "dualpipev", 2)
 
-        assert r_dp.step_time_ms <= r_1f1b.step_time_ms * 1.05, (
-            f"DualPipe should be ≈ 1F1B; got "
+        assert r_dp.step_time_ms <= r_1f1b.step_time_ms, (
+            f"DualPipe should be <= 1F1B; got "
             f"1f1b={r_1f1b.step_time_ms}, vpp={r_vpp.step_time_ms}, "
             f"dualpipe={r_dp.step_time_ms}, dualpipev={r_dpv.step_time_ms}"
         )
@@ -309,30 +312,30 @@ class TestPPScheduleRelativeComparison:
             f"VPP/1F1B step_time gap {ratio * 100:.1f}% exceeds 25%: VPP={r_vpp.step_time_ms}, 1F1B={r_1f1b.step_time_ms}"
 
     def test_step_time_dualpipe_less_than_1f1b(self, cached_reports):
-        """DualPipe step_time ≈ 1F1B (within 5%, same homogeneous fallback).
+        """DualPipe step_time <= 1F1B (bubble reduction or equal).
 
-        【原理】bubble reduction → step_time reduction（当有stage_id时）
-        【观测点】dualpipe.step_time ≈ 1f1b.step_time（允许5%误差）
+        【原理】DualPipe bubble ≤ 1F1B bubble → step_time 应不劣于 1F1B
+                  trace mode 下 homogeneous fallback 可能使两者相等
+        【观测点】dualpipe.step_time <= 1f1b.step_time
         """
         r_1f1b = _get_report(cached_reports, "1f1b")
         r_dp = _get_report(cached_reports, "dualpipe")
 
-        ratio = abs(r_dp.step_time_ms - r_1f1b.step_time_ms) / r_1f1b.step_time_ms
-        assert ratio < 0.05, \
-            f"DualPipe {r_dp.step_time_ms} differs from 1F1B {r_1f1b.step_time_ms} by {ratio*100:.1f}%"
+        assert r_dp.step_time_ms <= r_1f1b.step_time_ms, \
+            f"DualPipe {r_dp.step_time_ms} should be <= 1F1B {r_1f1b.step_time_ms}"
 
     def test_mfu_ordering_dualpipe_higher_than_1f1b(self, cached_reports):
-        """DualPipe MFU ≈ 1F1B (within 5%, same homogeneous fallback).
+        """DualPipe MFU >= 1F1B MFU (bubble reduction or equal).
 
-        【原理】DualPipe bubble=0 → step_time 最低 → MFU 最高（当有stage_id时）
-        【观测点】dualpipe.mfu ≈ 1f1b.mfu（允许5%误差）
+        【原理】DualPipe bubble ≤ 1F1B bubble → MFU 应不低于 1F1B
+                  trace mode 下 homogeneous fallback 可能使两者相等
+        【观测点】dualpipe.mfu >= 1f1b.mfu
         """
         r_1f1b = _get_report(cached_reports, "1f1b")
         r_dp = _get_report(cached_reports, "dualpipe")
 
-        ratio = abs(r_dp.mfu - r_1f1b.mfu) / max(r_dp.mfu, r_1f1b.mfu)
-        assert ratio < 0.05, \
-            f"DualPipe MFU {r_dp.mfu} differs from 1F1B {r_1f1b.mfu} by {ratio*100:.1f}%"
+        assert r_dp.mfu >= r_1f1b.mfu, \
+            f"DualPipe MFU {r_dp.mfu} should be >= 1F1B MFU {r_1f1b.mfu}"
 
     def test_mfu_dualpipe_and_dualpipev_close(self, cached_reports):
         """DualPipe and DualPipeV MFU within 20% (both have zero bubble at pp=2).
@@ -402,10 +405,10 @@ class TestPPScheduleFlopsConsistency:
         assert _get_p2p_volume_by_phase(g_1f1b) == _get_p2p_volume_by_phase(g_dp)
 
     def test_fwd_p2p_volume_linear_interpolation(self, cached_reports):
-        """fwd 通信量 DualPipeV >= 1F1B（更多 boundary → 更多通信）。
+        """fwd 通信量 DualPipeV >= 1F1B（更多 boundary → 更多通信或相等）。
 
-        【原理】每个 boundary 传递相同 residual stream 张量集合 → 字节数相同
-                  DualPipeV 有 2 个 boundary → fwd 通信量 >= 1F1B
+        【原理】每个 boundary 传递相同 residual stream 张量集合
+                  DualPipeV 有 2 个 boundary，但 trace mode 下 P2P 合并可能使通信量相等
         【观测点】fwd_volume(DualPipeV) >= fwd_volume(1F1B)
         """
         g_1f1b = _get_transformed_graph(cached_reports, "1f1b")
@@ -479,7 +482,7 @@ class TestPPScheduleFlopsConsistency:
 
         【原理】PP 分割必须覆盖所有层，无遗漏
         【观测点】每策略所有 stage 的 layer set union == {0,1,2,3}
-                  （若只有部分层有 stage_id 标注则跳过）
+                  （trace mode 下仅部分层有 stage_id 标注时跳过）
         """
         expected_layers = set(range(_CAPTURED_LAYERS))
         for schedule, vpp in self.CONFIGS:
@@ -491,6 +494,7 @@ class TestPPScheduleFlopsConsistency:
             for layers in assignment.values():
                 all_assigned |= layers
             if len(all_assigned) < len(expected_layers):
+                # trace mode: only some layers have stage_id annotations
                 continue
             assert all_assigned == expected_layers, \
                 f"{schedule}: missing layers {expected_layers - all_assigned}, got {all_assigned}"
@@ -509,6 +513,7 @@ class TestPPScheduleFlopsConsistency:
         for layers in assignment.values():
             all_layers |= layers
         if 0 not in all_layers or 1 not in all_layers:
+            # trace mode: L0/L1 may lack stage_id annotations
             return
         s0_layers = assignment.get(0, set())
         s1_layers = assignment.get(1, set())
@@ -529,6 +534,7 @@ class TestPPScheduleFlopsConsistency:
         for layers in assignment.values():
             all_layers |= layers
         if len(all_layers) < _CAPTURED_LAYERS:
+            # trace mode: not all layers have stage_id annotations
             return
         assert _get_layers_for_stage(g, 0) == {0, 2}
         assert _get_layers_for_stage(g, 1) == {1, 3}
