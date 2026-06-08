@@ -1181,6 +1181,9 @@ def _compute_optimizer_time(model: ModelSpec, system: SystemSpec, strategy: Stra
     """
     from zrt.training.models.memory import adam_params_on_rank
 
+    if strategy.ep > 1 and (strategy.dp < strategy.ep or strategy.dp % strategy.ep != 0):
+        raise ValueError(f"dp must be >= ep and divisible by ep (dp={strategy.dp}, ep={strategy.ep})")
+
     P = adam_params_on_rank(
         total_params=model.total_params(),
         n_layers=len(model.layers),

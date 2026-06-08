@@ -127,7 +127,16 @@ class CommDomain:
         dp = max(self.strategy.dp, 1)
         if ep <= 1:
             return dp
-        return max(1, dp // ep)
+        if dp < ep:
+            raise ValueError(
+                f"dp must be >= ep for expert-DP sharding (dp={dp}, ep={ep})"
+            )
+        if dp % ep != 0:
+            raise ValueError(
+                f"dp must be divisible by ep for expert-DP sharding "
+                f"(dp={dp}, ep={ep})"
+            )
+        return dp // ep
 
     def group_instances(self, kind: str) -> list[list[int]]:
         """All non-degenerate rank instances for ``kind``.

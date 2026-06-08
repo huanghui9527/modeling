@@ -207,10 +207,19 @@ def muon_flops_from_geometry(
         TP-Gathered row dim = ``hidden``, col dim = sharded).
       * PP shards layers across the ``pp`` stages.
     """
-    tp = max(1, tp)
-    ep = max(1, ep)
-    pp = max(1, pp)
-    dp = max(1, dp)
+    tp = max(1, tp); ep = max(1, ep); pp = max(1, pp); dp = max(1, dp)
+    if ep > 1:
+        if dp < ep:
+            raise ValueError(
+                f"dp must be >= ep for expert-DP sharding (dp={dp}, ep={ep})"
+            )
+        if dp % ep != 0:
+            raise ValueError(
+                f"dp must be divisible by ep for expert-DP sharding "
+                f"(dp={dp}, ep={ep})"
+            )
+
+
     moe_ffn_col = max(1, moe_ffn // tp) if moe_ffn else 0
     ffn_col = max(1, ffn // tp) if ffn else 0
     attn_col = max(1, hidden // tp)
@@ -229,7 +238,7 @@ def muon_flops_from_geometry(
     # ── Per-rank split ────────────────────────────────────────────────
     # Routed expert work lands on ``ep`` distinct ranks; within an EP rank,
     # remaining DP replicas (``dp // ep``) further parallelize NS.
-    ep_dp_replica = max(1, dp // ep) if ep > 1 else dp
+    ep_dp_replica = dp // ep if ep > 1 else dp
     routed_per_rank_per_layer = routed_layer_full // (ep * ep_dp_replica)
 
     non_routed_dp_div = dp if zero_stage >= 1 and dp > 1 else 1
