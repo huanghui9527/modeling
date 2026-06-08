@@ -21,4 +21,3 @@ config:
 targets:
   mfu: 0.4563
   tolerance: 0.20
-  strict_mfu_check: false
