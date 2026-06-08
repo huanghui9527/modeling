@@ -1,5 +1,5 @@
 name: deepseek_v3_2_ascend_910c
-description: "DeepSeek-V3.2, Ascend 910C, TP8 PP2 EP64 DP4, 8 nodes"
+description: "DeepSeek-V3.2, Ascend 910C, TP8 PP2 EP2 DP4, 8 nodes"
 model: deepseek_v3_2
 system:
   hw: ascend_910c
@@ -9,7 +9,7 @@ system:
 config:
   tp: 8
   pp: 2
-  ep: 64
+  ep: 2
   dp: 4
   zero_stage: 1
   micro_batch: 1

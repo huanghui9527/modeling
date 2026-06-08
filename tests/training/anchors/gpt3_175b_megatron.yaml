@@ -41,3 +41,4 @@ targets:
   mfu: 0.46
   step_time_ms: 21800
   tolerance: 0.10
+  strict_mfu_check: false

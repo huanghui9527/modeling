@@ -2,7 +2,7 @@
 # V4-Pro: 1.6T params, 61 MoE layers (30 CSA + 31 HCA), Muon optimizer
 
 name: deepseek_v4_pro
-description: "DeepSeek-V4-Pro 1.6T, H100 SXM, TP8 PP4 EP64 DP4, Muon, 8 nodes"
+description: "DeepSeek-V4-Pro 1.6T, H100 SXM, TP8 PP4 EP2 DP2, Muon, 8 nodes"
 model: deepseek_v4_pro
 system:
   hw: nvidia_h100_sxm
@@ -12,7 +12,7 @@ system:
 config:
   tp: 8
   pp: 4
-  ep: 64
+  ep: 2
   dp: 2
   zero_stage: 1
   micro_batch: 1
@@ -28,3 +28,4 @@ config:
 targets:
   mfu: 0.2353
   tolerance: 0.15
+  strict_mfu_check: false

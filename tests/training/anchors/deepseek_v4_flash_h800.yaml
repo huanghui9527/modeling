@@ -1,5 +1,5 @@
 name: deepseek_v4_flash_h800
-description: "DeepSeek-V4-Flash 291B, H800, TP8 PP2 EP32 DP2, Muon, 4 nodes"
+description: "DeepSeek-V4-Flash 291B, H800, TP8 PP2 EP2 DP2, Muon, 4 nodes"
 model: deepseek_v4_flash
 system:
   hw: nvidia_h800
@@ -9,7 +9,7 @@ system:
 config:
   tp: 8
   pp: 2
-  ep: 32
+  ep: 2
   dp: 2
   zero_stage: 1
   micro_batch: 1

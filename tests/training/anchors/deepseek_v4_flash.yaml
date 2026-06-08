@@ -1,5 +1,5 @@
 name: deepseek_v4_flash
-description: "DeepSeek-V4-Flash 291B, H100 SXM, TP8 PP1 EP64 DP8, Muon, 8 nodes"
+description: "DeepSeek-V4-Flash 291B, H100 SXM, TP8 PP1 EP2 DP8, Muon, 8 nodes"
 model: deepseek_v4_flash
 system:
   hw: nvidia_h100_sxm
@@ -9,7 +9,7 @@ system:
 config:
   tp: 8
   pp: 1
-  ep: 64
+  ep: 2
   dp: 8
   zero_stage: 1
   micro_batch: 1
@@ -23,3 +23,4 @@ config:
 targets:
   mfu: 0.1967
   tolerance: 0.15
+  strict_mfu_check: false

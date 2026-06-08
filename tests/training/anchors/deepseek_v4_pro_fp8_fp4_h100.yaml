@@ -3,7 +3,7 @@
 # rather than absolute numbers.
 
 name: deepseek_v4_pro_fp8_fp4_h100
-description: "DeepSeek-V4-Pro 1.6T, H100 SXM, TP8 PP4 EP64 DP4, FP8+FP4 mixed quant"
+description: "DeepSeek-V4-Pro 1.6T, H100 SXM, TP8 PP4 EP2 DP2, FP8+FP4 mixed quant"
 model:
   base: deepseek_v4_pro
   quant_preset: deepseek_v4_fp8_fp4
@@ -15,7 +15,7 @@ system:
 config:
   tp: 8
   pp: 4
-  ep: 64
+  ep: 2
   dp: 2
   zero_stage: 1
   micro_batch: 1

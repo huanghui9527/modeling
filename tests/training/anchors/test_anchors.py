@@ -251,11 +251,14 @@ def test_anchor_fp8_fp4_h100_faster_than_bf16():
     """
     from zrt.training.io.config_loader import load_anchor_config
     from zrt.training.search.estimator import estimate
+    from zrt.training.ir.opgraph_builder import build_opgraph
 
     m_q, s_q, st_q, _ = load_anchor_config(_FP8_FP4_H100_ANCHOR)
     m_b, s_b, st_b, _ = load_anchor_config(_BF16_BASELINE_ANCHOR)
-    rep_q = estimate(m_q, s_q, st_q)
-    rep_b = estimate(m_b, s_b, st_b)
+    graph_q = build_opgraph(m_q, st_q)
+    graph_b = build_opgraph(m_b, st_b)
+    rep_q = estimate(m_q, s_q, st_q, graph=graph_q)
+    rep_b = estimate(m_b, s_b, st_b, graph=graph_b)
     assert rep_q.step_time_ms < rep_b.step_time_ms, (
         f"FP8/FP4 step_time ({rep_q.step_time_ms:.2f} ms) should be "
         f"smaller than BF16 baseline ({rep_b.step_time_ms:.2f} ms)"
@@ -272,11 +275,14 @@ def test_anchor_fp8_fp4_h100_peak_memory_lower():
     """
     from zrt.training.io.config_loader import load_anchor_config
     from zrt.training.search.estimator import estimate
+    from zrt.training.ir.opgraph_builder import build_opgraph
 
     m_q, s_q, st_q, _ = load_anchor_config(_FP8_FP4_H100_ANCHOR)
     m_b, s_b, st_b, _ = load_anchor_config(_BF16_BASELINE_ANCHOR)
-    rep_q = estimate(m_q, s_q, st_q)
-    rep_b = estimate(m_b, s_b, st_b)
+    graph_q = build_opgraph(m_q, st_q)
+    graph_b = build_opgraph(m_b, st_b)
+    rep_q = estimate(m_q, s_q, st_q, graph=graph_q)
+    rep_b = estimate(m_b, s_b, st_b, graph=graph_b)
     peak_q = rep_q.memory.peak_overall
     peak_b = rep_b.memory.peak_overall
     assert peak_q <= peak_b, (
@@ -289,11 +295,14 @@ def test_anchor_fp8_fp4_b300_faster_than_h100():
     """B300 (native FP4) should be faster than H100 (FP4 falls back to FP8)."""
     from zrt.training.io.config_loader import load_anchor_config
     from zrt.training.search.estimator import estimate
+    from zrt.training.ir.opgraph_builder import build_opgraph
 
     m_h, s_h, st_h, _ = load_anchor_config(_FP8_FP4_H100_ANCHOR)
     m_b, s_b, st_b, _ = load_anchor_config(_FP8_FP4_B300_ANCHOR)
-    rep_h = estimate(m_h, s_h, st_h)
-    rep_b = estimate(m_b, s_b, st_b)
+    graph_h = build_opgraph(m_h, st_h)
+    graph_b = build_opgraph(m_b, st_b)
+    rep_h = estimate(m_h, s_h, st_h, graph=graph_h)
+    rep_b = estimate(m_b, s_b, st_b, graph=graph_b)
     assert rep_b.step_time_ms < rep_h.step_time_ms, (
         f"B300 step_time ({rep_b.step_time_ms:.2f} ms) should be smaller "
         f"than H100 step_time ({rep_h.step_time_ms:.2f} ms) for FP8/FP4"
