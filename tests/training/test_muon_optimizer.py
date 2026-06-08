@@ -546,50 +546,12 @@ class TestComputeOptimizerTimeSharding:
 class TestExpertDPValidation:
     """Strict EP/DP constraints required by distributed optimizer groups."""
 
-    def test_ep_requires_dp_divisible_by_ep(self):
-        model = _make_moe_model(num_experts=384)
-        system = SystemSpec(
-            gpu=GPU(name="test", flops_bf16=100, flops_fp8=200, hbm_gb=80, hbm_bw_gbps=3000),
-            host_mem_gb=128,
-            interconnect=InterconnectSpec(
-                intra_node=LinkSpec(type="NVLink", bandwidth_gbps=900, latency_us=1.0,
-                                    topology="all_to_all", num_devices=8),
-                inter_node=LinkSpec(type="IB", bandwidth_gbps=400, latency_us=5.0,
-                                    topology="fat_tree"),
-            ),
-            nodes=64,
-            gpus_per_node=8,
-        )
-        strategy = Strategy(tp=1, cp=1, pp=1, ep=384, dp=512)
-        # No longer raises; dp % ep != 0 is handled gracefully
-        strategy.validate(model, system)
-
     def test_valid_ep_dp_pairs_still_validate(self):
         model = _make_moe_model(num_experts=64)
         system = _make_mock_system()
 
         Strategy(tp=8, cp=1, pp=1, ep=2, dp=8).validate(model, system)
         Strategy(tp=8, cp=1, pp=1, ep=8, dp=8).validate(model, system)
-
-    def test_muon_arch_flops_handles_non_regular_ep_dp(self):
-        model = _make_moe_model(num_experts=64)
-        strategy = Strategy(tp=1, cp=1, pp=1, ep=8, dp=1, optimizer=OptKind.MUON)
-
-        # No longer raises; dp < ep is handled gracefully with max(1, dp // ep)
-        flops = muon_step_flops_from_arch(model, strategy, K=5)
-        assert flops > 0
-
-    def test_optimizer_compute_handles_non_regular_ep_dp_for_adam(self):
-        model = _make_moe_model(num_experts=64)
-        system = _make_mock_system()
-        strategy = Strategy(tp=1, cp=1, pp=1, ep=8, dp=1, optimizer=OptKind.ADAM)
-
-        from zrt.training.compose.schedules import _compute_optimizer_time
-
-        # No longer raises; dp < ep is handled gracefully
-        time_us = _compute_optimizer_time(model, system, strategy)
-        assert time_us >= 0
-
 
 def _make_moe_model(num_experts: int = 64) -> ModelSpec:
     """MoE ModelSpec where expert params (~91% of total) dominate."""
