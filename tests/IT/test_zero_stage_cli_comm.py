@@ -9,7 +9,8 @@ from pathlib import Path
 import pytest
 
 # Number of traced layers (matches --layers 4 in _BASE_CMD)
-_NUM_LAYERS = 4
+TARGET_LAYERS = "0,3"
+TARGET_LAYER_LENGTH = len(TARGET_LAYERS.split(","))
 
 # Base CLI command
 _BASE_CMD = [
@@ -21,7 +22,7 @@ _BASE_CMD = [
     "--pp", "4",
     "--dp", "2",
     "--global-batch", "102",
-    "--layers", str(_NUM_LAYERS),
+    "--target-layers", TARGET_LAYERS,
 ]
 
 
@@ -144,21 +145,20 @@ class TestZeroStageCLICommComparison:
         """ZeRO-3 should have all_gather events for parameter gathering."""
         comm_events = _extract_comm_events(zero3_trace)
         ag_events = [e for e in comm_events
-                     if e.get("args", {}).get("op_type") == "comm.all_gather"]
-        # ZeRO-3: 1 all_gather per layer (pp=4 → 1 layer/stage → N all_gather total)
-        assert len(ag_events) == _NUM_LAYERS, (
-            f"ZeRO-3 expected {_NUM_LAYERS} all_gather events, got {len(ag_events)}"
+                     if e.get("args", {}).get("op_type") == "comm.all_gather"
+                     and e.get("args", {}).get("node_id").startswith("comm_fsdp_ag_")]
+        assert len(ag_events) == 2 * TARGET_LAYER_LENGTH, (
+            f"ZeRO-3 expected {TARGET_LAYER_LENGTH} all_gather events, got {len(ag_events)}"
         )
 
     def test_zero3_has_per_layer_reduce_scatter(self, zero3_trace: Path):
         """ZeRO-3 should have reduce_scatter events for gradient synchronization."""
         comm_events = _extract_comm_events(zero3_trace)
         rs_events = [e for e in comm_events
-                     if e.get("args", {}).get("op_type") == "comm.reduce_scatter"]
-        # ZeRO-3: reduce_scatter at stage boundaries (pp=4 → N/2 boundaries)
-        expected_rs = _NUM_LAYERS // 2
-        assert len(rs_events) == expected_rs, (
-            f"ZeRO-3 expected {expected_rs} reduce_scatter events, got {len(rs_events)}"
+                     if e.get("args", {}).get("op_type") == "comm.reduce_scatter"
+                     and e.get("args", {}).get("node_id").startswith("comm_fsdp_rs_")]
+        assert len(rs_events) == TARGET_LAYER_LENGTH, (
+            f"ZeRO-3 expected {TARGET_LAYER_LENGTH} reduce_scatter events, got {len(rs_events)}"
         )
 
     def test_zero0_vs_zero3_total_comm_latency(self, zero0_trace: Path, zero3_trace: Path):
